@@ -1,0 +1,2 @@
+image_id,file_name,source_dataset,split,pair_key,paired_text,metadata_json
+example_001,example_001.jpg,my_dataset,train,example_001,,"{}"

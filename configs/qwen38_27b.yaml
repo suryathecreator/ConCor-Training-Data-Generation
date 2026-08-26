@@ -1,0 +1,281 @@
+project_root: .
+output_root: outputs
+run_id: concor_qwen38_27b
+random_seed: 20260826
+continue_on_error: true
+resume: true
+
+# Campaign workers replace this with each unit's durable manifest. For a direct
+# single-node run, point it at a JSONL/CSV manifest described in docs/DATA.md.
+dataset:
+  manifest_path: examples/images.jsonl
+  image_root: null
+  limit: null
+  start_index: 0
+
+pipeline:
+  target_successful_images: 0
+  bcc_ready_window: 32
+  image_review_window: 32
+  bcc_iteration_window: 4
+
+campaign:
+  corpus_name: concor_bcc_qwen38_27b
+  initial_target_total: 20000
+  source_unit_size: 8
+  milestone_pairs: 100
+  preview_pairs: 10
+  accept_parseable_with_flags: true
+
+inference:
+  backend: vllm
+  vllm_version: 0.26.0
+  require_correctness_canary: true
+  allow_transformers_fallback: false
+
+image_review:
+  enabled: true
+  backend: vllm
+  model_name: Qwen/Qwen3.8-27B
+  local_files_only: false
+  torch_dtype: bfloat16
+  device_map: auto
+  max_new_tokens: 768
+  enable_thinking: false
+  temperature: 0.0
+  top_p: 0.9
+  batch_size: 24
+  max_images_per_prompt: 1
+  max_model_len: 16384
+  max_num_seqs: 24
+  max_num_batched_tokens: 32768
+  gpu_memory_utilization: 0.82
+  enable_prefix_caching: true
+  tensor_parallel_size: 1
+  skip_mm_profiling: true
+  min_distinct_objects: 20
+  borderline_max_distinct_objects: 24
+  min_side_px: 384
+  min_total_pixels: 250000
+  seed_offset: 100000
+  reject_image_types: [document, screenshot, chart, graph, map, mostly-text page, text page, single-object product shot, product shot, pure landscape, landscape/background, background, architecture-only]
+  rationale_reject_terms: [indistinct, not distinct, mostly background, background texture, no clear objects, few clear objects, too small, ambiguous, tangled, branches, foliage, repeated texture]
+  prompt: |
+    Decide whether this image is worth running SAM3 text-prompt segmentation for grounded image-text correspondence data.
+
+    Keep the image only if it likely contains at least 20 distinct, concrete things that can be segmented as independent instance masks. Repeated object types are useful when instances remain visually distinguishable. People, animals, furniture, vehicles, tools, clothing, accessories, readable signs, body parts, and countable natural objects are valid. We ultimately need a coherent dense caption with at least 10 instance-linked text groups.
+
+    Reject low-quality images and scenes dominated by stuff, distant indistinct crowds, background texture, architecture alone, documents/screenshots, flat artwork, single-object closeups, tangled foliage, food mixtures, reflective glass, heavy blur, or repeated objects that cannot be referred to individually.
+
+    If accepting, produce concise concrete noun prompts for SAM3. Prefer canonical categories likely to retrieve several useful instances. Avoid stuff, abstract regions, textures, and generic words such as object or area.
+
+    Return one compact JSON object and nothing else:
+    {"worth_segmenting":true,"estimated_maskable_entities":25,"image_type":"natural_photo","rationale":"one short line","reject_reason":"","sam3_prompts":["people","chairs","bags","cups","signs"]}
+
+sam3:
+  # Set SAM3_REPO_ROOT when SAM3 is checked out rather than installed.
+  repo_root: null
+  device: cuda
+  resolution: 1008
+  confidence_threshold: 0.45
+  load_from_hf: true
+  compile: false
+  autocast: true
+  autocast_dtype: bfloat16
+  text_prompt_batch_size: 32
+  emit_debug_derivatives: false
+  emit_overview: false
+  crop_padding_px: 32
+
+filter:
+  min_mask_area: 192
+  min_mask_area_fraction: 0.0005
+  max_masks_per_image: 0
+  dedupe_iou: 0.98
+  disable_dedupe_iou: false
+  min_bbox_fill: 0.08
+  max_mask_area_fraction: 0.7
+  max_bbox_area_fraction: 0.9
+  containment_threshold: 1.01
+  bbox_containment_threshold: 1.01
+  contained_area_ratio: 0.0
+  containment_score_margin: 0.0
+  max_components: 12
+  sparse_component_bbox_fill: 0.18
+
+caption:
+  backend: vllm
+  model_name: Qwen/Qwen3.8-27B
+  local_files_only: false
+  torch_dtype: bfloat16
+  device_map: auto
+  max_new_tokens: 192
+  enable_thinking: false
+  temperature: 0.0
+  top_p: 0.9
+  batch_size: 32
+  max_masks_per_image: 0
+  max_total_masks: 0
+  input_image_keys: [inverse_crop_path]
+  safetensors_load_strategy: prefetch
+  gdn_prefill_backend: triton
+  flash_attn_version: 2
+  max_images_per_prompt: 1
+  max_model_len: 16384
+  max_num_seqs: 32
+  max_num_batched_tokens: 65536
+  gpu_memory_utilization: 0.82
+  enable_prefix_caching: true
+  tensor_parallel_size: 1
+  skip_mm_profiling: true
+  prompt: |
+    You are captioning one SAM3 instance-mask candidate.
+
+    Strong proposal context:
+    - SAM3 was queried with: "{source_prompt}"
+    - Treat that proposal as the expected main subject and a strong identity prior.
+    - The visible retained pixels are the candidate mask to describe. The mask has already passed geometric sanity filters.
+
+    The image is a close crop of that mask. Pixels outside the mask were replaced by the synthetic RGB color {inverse_background_rgb}, selected automatically to contrast with the retained object's RGB distribution. That synthetic color is never content, never a background, and must never be described. Do not mention any background, backdrop, scene, setting, location, surrounding object, image, crop, view, silhouette, or fill color.
+
+    Describe only the visible retained pixels, targeting the proposed SAM3 subject. Use a concrete head noun plus supported visible attributes. Partial objects, body parts, clothing, hair, and occlusion are valid. Reject if the retained pixels do not plausibly match the SAM3 proposal, merge multiple instances, are too ambiguous, or require guessing.
+
+    Return one compact JSON object and nothing else:
+    {"reject":false,"reject_reason":"","object":"...","caption":"...","attributes":["..."],"uncertain":false}
+    Keep the caption under 24 words. If rejecting, leave object, caption, and attributes empty.
+
+quality_filter:
+  enabled: true
+  backend: vllm
+  model_name: Qwen/Qwen3.8-27B
+  local_files_only: false
+  torch_dtype: bfloat16
+  device_map: auto
+  max_new_tokens: 192
+  enable_thinking: false
+  temperature: 0.0
+  top_p: 0.9
+  batch_size: 32
+  input_image_keys: [inverse_crop_path]
+  min_final_masks_for_accept: 10
+  mask_review_seed_offset: 200000
+  max_images_per_prompt: 1
+  max_model_len: 16384
+  max_num_seqs: 32
+  max_num_batched_tokens: 65536
+  gpu_memory_utilization: 0.82
+  enable_prefix_caching: true
+  tensor_parallel_size: 1
+  skip_mm_profiling: true
+  mask_review_prompt: |
+    Review this SAM3 mask-caption pair. Treat the SAM3 proposal "{source_prompt}" as the expected main subject and a strong identity prior.
+
+    The retained pixels are the mask candidate. All other pixels were replaced with synthetic RGB {inverse_background_rgb}; this fill is not visible content or background and must not support any caption claim.
+
+    Proposed fields:
+    object: {object}
+    caption: {caption}
+    attributes: {attributes}
+    source_sam3_prompt: {source_prompt}
+    mask_area_pixels: {area}
+    bbox: {bbox}
+    sam3_score: {sam3_score}
+
+    Keep only if the caption faithfully describes the retained instance and is compatible with the SAM3 proposal. Reject background, backdrop, scene, crop/view, location, surrounding-object, or fill-color language. Reject a wrong category, unsupported attribute, merged/grouped instance, under-covered or over-inclusive mask, sparse fragment, or ambiguous content. Correct only small wording issues that are directly visible.
+
+    Return one compact JSON object and nothing else:
+    {"keep":true,"reason":"one short line","failure_modes":[],"corrected_object":"","corrected_caption":"","corrected_attributes":[]}
+
+consistency_filter:
+  enabled: true
+  metric: mask_iou
+  mask_iou_threshold: 0.5
+  same_region_min_bbox_overlap: 0.1
+  prompt_batch_size: 32
+
+# The detailed BCC generation, visual audit, deterministic checks, and one
+# rewrite prompts live with versioned code in correspondence_stage.py and
+# one_rewrite_stage.py. Masks are eligible at 10 pre-BCC; final publishing is
+# count-based and does not force the model to mention every mask.
+image_caption:
+  enabled: true
+  backend: vllm
+  model_name: Qwen/Qwen3.8-27B
+  local_files_only: false
+  torch_dtype: bfloat16
+  device_map: auto
+  max_new_tokens: 2048
+  max_new_tokens_cap: 8192
+  tokens_per_mask: 48
+  max_visual_tokens_per_batch: 48000
+  enable_thinking: false
+  temperature: 0.0
+  top_p: 0.9
+  batch_size: 2
+  min_input_masks: 10
+  min_groups: 10
+  require_all_masks: false
+  canonicalize_duplicate_masks: true
+  duplicate_containment_threshold: 0.97
+  duplicate_iou_threshold: 0.55
+  duplicate_near_exact_iou: 0.85
+  duplicate_description_jaccard: 0.55
+  composite_child_containment_threshold: 0.9
+  composite_union_iou_threshold: 0.85
+  composite_child_max_iou: 0.2
+  max_attempts: 1
+  seed_offset: 300000
+  max_images_per_prompt: 128
+  max_model_len: 49152
+  max_num_seqs: 2
+  max_num_batched_tokens: 49152
+  gpu_memory_utilization: 0.80
+  enable_prefix_caching: true
+  tensor_parallel_size: 1
+  skip_mm_profiling: true
+
+image_caption_audit:
+  enabled: true
+  backend: vllm
+  model_name: Qwen/Qwen3.8-27B
+  local_files_only: false
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.80
+  max_model_len: 49152
+  max_num_seqs: 2
+  max_num_batched_tokens: 49152
+  max_images_per_prompt: 128
+  batch_size: 2
+  max_visual_tokens_per_batch: 48000
+  max_new_tokens: 2048
+  max_new_tokens_cap: 8192
+  tokens_per_mask: 48
+  enable_prefix_caching: true
+  skip_mm_profiling: true
+  enable_thinking: false
+  temperature: 0.0
+  seed_offset: 350000
+
+image_caption_qa:
+  enabled: true
+  backend: vllm
+  model_name: Qwen/Qwen3.8-27B
+  local_files_only: false
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.80
+  max_model_len: 49152
+  max_num_seqs: 2
+  max_num_batched_tokens: 49152
+  max_images_per_prompt: 128
+  batch_size: 2
+  max_visual_tokens_per_batch: 48000
+  max_new_tokens: 2048
+  max_new_tokens_cap: 8192
+  tokens_per_mask: 48
+  enable_prefix_caching: true
+  skip_mm_profiling: true
+  enable_thinking: false
+  temperature: 0.0
+  min_linked_masks_after_caption: 10
+  max_attempts: 1
+  seed_offset: 400000

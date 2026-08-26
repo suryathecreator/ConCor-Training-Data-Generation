@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+CAMPAIGN_ROOT="${CAMPAIGN_ROOT:?CAMPAIGN_ROOT is required}"
+HF_REPO_ID="${HF_REPO_ID:-suryadv/gpic-bcc-sam3-qwen38-27b}"
+VLLM_PYTHON="${VLLM_PYTHON:-$REPO_ROOT/.venv/bin/python}"
+HF_CLI="${HF_CLI:-$REPO_ROOT/.venv/bin/hf}"
+EXPORT_DIR="${EXPORT_DIR:-$CAMPAIGN_ROOT/hf_export}"
+SCAFFOLD="$REPO_ROOT/hf_dataset"
+
+mkdir -p "$EXPORT_DIR"
+rsync -a "$SCAFFOLD/" "$EXPORT_DIR/"
+"$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-export-hf \
+  "$CAMPAIGN_ROOT" "$EXPORT_DIR" --shard-size 100
+mkdir -p "$EXPORT_DIR/manifests"
+rsync -a "$CAMPAIGN_ROOT/campaign_registry.json" "$EXPORT_DIR/manifests/"
+rsync -a "$CAMPAIGN_ROOT/reports/" "$EXPORT_DIR/manifests/reports/"
+"$HF_CLI" repos create "$HF_REPO_ID" --repo-type dataset --exist-ok
+"$HF_CLI" upload-large-folder "$HF_REPO_ID" "$EXPORT_DIR" \
+  --repo-type dataset --num-workers "${HF_UPLOAD_WORKERS:-8}"

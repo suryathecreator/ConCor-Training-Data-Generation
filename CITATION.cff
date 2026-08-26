@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If this pipeline helps your work, please cite the repository and the upstream BCC, SAM 3, GPIC, and Qwen papers."
+title: "ConCor Training Data Generation"
+type: software
+authors:
+  - family-names: "suryathecreator"
+repository-code: "https://github.com/suryathecreator/ConCor-Training-Data-Generation"
+license: MIT
+version: 0.1.0
+date-released: 2026-08-26
