@@ -19,6 +19,7 @@ HF_HOME="${HF_HOME:-$REPO_ROOT/.cache/huggingface}"
 
 cd "$REPO_ROOT"
 export HF_HOME PYTHONUNBUFFERED=1
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-init "$CAMPAIGN_ROOT" \
   --unit-size "$UNIT_SIZE" --seed "$SEED" --dataset "$DATASET_NAME" --split "$SOURCE_SPLIT" \
   --terminal-stage bcc --preview-pairs 10

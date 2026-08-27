@@ -10,4 +10,5 @@
 set -euo pipefail
 REPO_ROOT="${REPO_ROOT:?REPO_ROOT is required}"
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 exec "$REPO_ROOT/scripts/package_qwen_python_runtime.sh"

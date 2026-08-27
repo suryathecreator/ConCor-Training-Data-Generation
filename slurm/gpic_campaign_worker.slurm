@@ -34,7 +34,7 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export VLLM_USE_FLASHINFER_SAMPLER=0
-export PYTHONPATH="$REPO_ROOT:$SAM3_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO_ROOT/src:$SAM3_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export WN_DATA_DIR="${WN_DATA_DIR:-$REPO_ROOT/.runtime/wordnet}"
 # Packed inputs are expanded below node-local storage and exposed through
 # short-lived directory symlinks. This avoids creating hundreds of small files

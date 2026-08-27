@@ -9,6 +9,7 @@ HF_CLI="${HF_CLI:-$REPO_ROOT/.venv/bin/hf}"
 EXPORT_DIR="${EXPORT_DIR:-$CAMPAIGN_ROOT/hf_export}"
 SCAFFOLD="$REPO_ROOT/hf_dataset"
 
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$EXPORT_DIR"
 rsync -a "$SCAFFOLD/" "$EXPORT_DIR/"
 "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-export-hf \

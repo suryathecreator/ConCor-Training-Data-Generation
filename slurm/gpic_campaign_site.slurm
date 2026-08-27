@@ -15,6 +15,7 @@ SSH_TARGET="${SITE_SSH_TARGET:-user@login.cluster.example}"
 READY="$CAMPAIGN_ROOT/site/READY.json"
 PYTHON_BIN="${VLLM_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 unset VLLM_PYTHON
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 while [ ! -s "$READY" ]; do
   sleep 30

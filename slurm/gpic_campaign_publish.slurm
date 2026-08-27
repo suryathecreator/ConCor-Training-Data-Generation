@@ -13,5 +13,6 @@ CAMPAIGN_ROOT="${CAMPAIGN_ROOT:?CAMPAIGN_ROOT is required}"
 PYTHON_BIN="${VLLM_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 unset VLLM_PYTHON
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 "$PYTHON_BIN" -m sam3_mask_captioning.cli campaign-publish "$CAMPAIGN_ROOT" --daemon --poll-seconds 30

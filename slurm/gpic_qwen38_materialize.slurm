@@ -21,6 +21,7 @@ DATASET_NAME="${DATASET_NAME:-stanford-vision-lab/gpic}"
 SOURCE_SPLIT="${SOURCE_SPLIT:-train}"
 
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 mkdir -p slurm/logs "$CAMPAIGN_ROOT"
 "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-init "$CAMPAIGN_ROOT" \

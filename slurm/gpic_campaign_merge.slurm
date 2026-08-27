@@ -14,6 +14,7 @@ STAGE="${STAGE:?STAGE is required}"
 PYTHON_BIN="${VLLM_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 unset VLLM_PYTHON
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 "$PYTHON_BIN" -m sam3_mask_captioning.cli campaign-merge "$CAMPAIGN_ROOT" \
   --stage "$STAGE" --wait --poll-seconds "${MERGE_POLL_SECONDS:-30}"
