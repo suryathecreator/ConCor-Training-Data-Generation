@@ -112,7 +112,18 @@ fi
 flock -u 8
 export BCC_QWEN_MODEL_PATH="$NODE_MODEL_DIR"
 
-JOB_CACHE_ROOT="${SLURM_TMPDIR:-/tmp}/${USER:-user}-bcc-runtime-cache"
+# Model weights and the packed Python runtime remain node-shared above under
+# flock. Compilation, Triton, visual warmup, and other mutable engine state are
+# job-local: one-GPU H200 jobs and two-GPU A40 jobs may be co-located on the
+# same node, and must never extract or compile into each other's directories.
+if [ -n "${SLURM_ARRAY_JOB_ID:-}" ]; then
+  JOB_CACHE_OWNER="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"
+elif [ -n "${SLURM_JOB_ID:-}" ]; then
+  JOB_CACHE_OWNER="$SLURM_JOB_ID"
+else
+  JOB_CACHE_OWNER="local-$$"
+fi
+JOB_CACHE_ROOT="${BCC_JOB_CACHE_ROOT:-${SLURM_TMPDIR:-/tmp}/${USER:-user}-bcc-runtime-cache/$JOB_CACHE_OWNER}"
 PERSISTENT_CACHE_DIR="${BCC_PERSISTENT_CACHE_DIR:-$REPO_ROOT/.runtime/qwen38_compile_cache_archives}"
 CAMPAIGN_CACHE_DIR="$CAMPAIGN_ROOT/runtime_cache_archives"
 BASE_CACHE_KEY="qwen38-27b-${GPU_COHORT}-tp${TENSOR_PARALLEL_SIZE}-vllm026-nvcc${NVCC_RELEASE}"
