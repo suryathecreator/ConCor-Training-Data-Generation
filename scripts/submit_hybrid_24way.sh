@@ -11,6 +11,7 @@ MODE="${MODE:-production}"
 START_STAGE="${START_STAGE:-image-review}"
 CONTINUATIONS="${CONTINUATIONS:-}"
 CACHE_ARCHIVES_READY="${CACHE_ARCHIVES_READY:-0}"
+HOLD_MATERIALIZER="${HOLD_MATERIALIZER:-1}"
 VLLM_PYTHON="${VLLM_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 SAM3_PYTHON="${SAM3_PYTHON:-$REPO_ROOT/.venv-sam3/bin/python}"
 SAM3_REPO_ROOT="${SAM3_REPO_ROOT:-$REPO_ROOT/third_party/sam3}"
@@ -127,15 +128,25 @@ parsed_job_id() {
 }
 
 materialize_job="${MATERIALIZE_JOB_ID:-}"
+release_materialize=0
 if [ -z "$materialize_job" ]; then
+  materialize_hold_args=()
+  if [ "$HOLD_MATERIALIZER" = "1" ]; then
+    # Keep the dependency root visible while the complete graph is submitted.
+    # Hyak can purge a very short completed materializer before a throttled
+    # sbatch client registers the next afterok dependency.
+    materialize_hold_args=(--hold)
+  fi
   if ! materialize_submission="$(sbatch --parsable \
     --partition="$CPU_PARTITION" "${CPU_ACCOUNT_ARGS[@]}" \
+    "${materialize_hold_args[@]}" \
     --export="ALL,$common_export,TARGET_TOTAL=$TARGET_TOTAL,UNIT_SIZE=$UNIT_SIZE,SEED=$SEED" \
     "$REPO_ROOT/slurm/gpic_qwen38_materialize.slurm")"; then
     echo "Failed to submit campaign materializer" >&2
     exit 1
   fi
   materialize_job="$(parsed_job_id "$materialize_submission" materializer)"
+  [ "$HOLD_MATERIALIZER" = "1" ] && release_materialize=1
 fi
 
 # Build the immutable small-file runtime once. Prewarms wait for this job, so
@@ -233,7 +244,10 @@ submit_worker_chain() {
   local qwen=0
   case "$stage" in image-review|mask-caption-qa|bcc) qwen=1 ;; esac
   local first_dependency="afterok:$prerequisite"
-  if [ "$qwen" = "1" ] && [ -n "$prewarm" ] && [ "$CACHE_ARCHIVES_READY" != "1" ]; then
+  # `ready` is an explicit recovery sentinel: the matching immutable archive
+  # already exists, but its original prewarm job may be too old for Slurm to
+  # accept as a dependency. A numeric value remains a real afterok dependency.
+  if [ "$qwen" = "1" ] && [ -n "$prewarm" ] && [ "$prewarm" != "ready" ] && [ "$CACHE_ARCHIVES_READY" != "1" ]; then
     first_dependency="$first_dependency:$prewarm"
   fi
   local max_model_len=16384 max_num_seqs=32 memory=0.82
@@ -365,5 +379,8 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 ledger="$CAMPAIGN_ROOT/submissions/$timestamp.txt"
 printf '%bpublisher=%s\nsite=%s\nexport=%s\ntarget_total=%s\nunit_size=%s\na40_max_units=%s\nh200_max_units=%s\nmode=%s\nstart_stage=%s\n' \
   "$submission_lines" "$publisher_job" "$site_job" "$export_job" "$TARGET_TOTAL" "$UNIT_SIZE" "$A40_MAX_UNITS" "$H200_MAX_UNITS" "$MODE" "$START_STAGE" > "$ledger"
+if [ "$release_materialize" = "1" ]; then
+  scontrol release "$materialize_job"
+fi
 echo "materialize_job=$materialize_job publisher_job=$publisher_job site_job=$site_job export_job=$export_job"
 echo "submission_ledger=$ledger"
