@@ -31,6 +31,23 @@ PYTHON_RUNTIME_ARCHIVE="${BCC_PYTHON_RUNTIME_ARCHIVE:-$REPO_ROOT/.runtime/qwen38
 PYTHON_RUNTIME_METADATA="${PYTHON_RUNTIME_ARCHIVE%.tar.zst}.metadata"
 WORDNET_DIR="${WN_DATA_DIR:-$REPO_ROOT/.runtime/wordnet}"
 
+# HF_HOME is often redirected to high-capacity scratch for model/data caches,
+# while `hf auth login` keeps the credential in the user's standard cache.
+# Pass only that file path to jobs; never place the token itself in sbatch
+# arguments, logs, or the repository.
+if [ -z "$TOKEN_FILE" ]; then
+  token_candidates=("$HF_HOME/token")
+  if [ -n "${HOME:-}" ]; then
+    token_candidates+=("$HOME/.cache/huggingface/token")
+  fi
+  for token_candidate in "${token_candidates[@]}"; do
+    if [ -s "$token_candidate" ]; then
+      TOKEN_FILE="$token_candidate"
+      break
+    fi
+  done
+fi
+
 CPU_PARTITION="${CPU_PARTITION:-cpu}"
 CPU_ACCOUNT="${CPU_ACCOUNT:-}"
 A40_PARTITION="${A40_PARTITION:-gpu-a40}"

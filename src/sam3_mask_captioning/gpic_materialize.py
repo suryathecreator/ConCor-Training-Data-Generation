@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import tarfile
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +25,16 @@ from .campaign_manifest import (
 )
 from .io_utils import write_json
 from .selection import is_excluded, load_exclusion_csv
+
+
+def _materialize_write_workers() -> int:
+    configured = os.environ.get("BCC_MATERIALIZE_WRITE_WORKERS")
+    if configured:
+        return max(1, min(64, int(configured)))
+    allocated = int(os.environ.get("SLURM_CPUS_PER_TASK") or min(8, os.cpu_count() or 1))
+    # Unit creation is dominated by independent shared-filesystem metadata and
+    # archive writes, so two I/O threads per allocated CPU is intentional.
+    return max(1, min(16, 2 * allocated))
 
 
 def _candidate_tars(repo_id: str, split: str, token: str | None) -> list[str]:
@@ -169,123 +182,152 @@ def extend_from_gpic(
     unit_index = int(registry.get("unit_count") or 0)
     pending: list[dict[str, Any]] = []
     committed: list[dict[str, Any]] = []
-    units_added = 0
+    accepted_count = 0
+    units_submitted = 0
+    next_write_offset = 0
     inspected_tars = 0
     next_tar_index = tar_index
     next_key_index = key_index
+    write_workers = _materialize_write_workers()
+    inflight: deque[Future[tuple[list[dict[str, Any]], dict[str, Any]]]] = deque()
+    executor = ThreadPoolExecutor(
+        max_workers=write_workers, thread_name_prefix="gpic-source-unit"
+    )
 
-    while tar_index < len(tar_paths) and len(committed) + len(pending) < requested:
-        if max_tars is not None and inspected_tars >= int(max_tars):
-            break
-        repo_tar = tar_paths[tar_index]
-        local_tar = _download_tar(repo_id, repo_tar, token, cache_dir)
-        inspected_tars += 1
-        with tarfile.open(local_tar, "r") as archive:
-            json_members: dict[str, tarfile.TarInfo] = {}
-            image_members: dict[str, tarfile.TarInfo] = {}
-            for member in archive.getmembers():
-                if not member.isfile():
-                    continue
-                key, suffix = _member_key(member.name)
-                if suffix == ".json":
-                    json_members[key] = member
-                elif suffix in IMAGE_SUFFIXES:
-                    image_members[key] = member
-            keys = _stable_key_order(
-                sorted(set(json_members) & set(image_members)), seed, repo_tar
-            )
-            cursor = key_index if tar_index == int(selection.get("tar_index") or 0) else 0
-            while cursor < len(keys) and len(committed) + len(pending) < requested:
-                remaining = requested - len(committed) - len(pending)
-                candidate_keys: list[str] = []
-                while cursor < len(keys) and len(candidate_keys) < remaining:
-                    key = keys[cursor]
-                    cursor += 1
-                    if key not in existing_keys and not is_excluded(
-                        exclusions,
-                        key,
-                        image_members[key].name,
-                        json_members[key].name,
-                    ):
-                        candidate_keys.append(key)
-
-                # Selection still uses the exact seeded random order above.
-                # Only physical reads are reordered; emit rows in the original
-                # selection order so IDs and cursor semantics stay unchanged.
-                loaded: dict[str, tuple[bytes, dict[str, Any]]] = {}
-                for key in _physical_key_order(candidate_keys, image_members, json_members):
-                    extracted = archive.extractfile(image_members[key])
-                    if extracted is None:
-                        continue
-                    payload = extracted.read()
-                    try:
-                        with Image.open(__import__("io").BytesIO(payload)) as image:
-                            image.verify()
-                    except Exception:
-                        continue
-                    loaded[key] = (payload, _json_member(archive, json_members[key]))
-
-                for key in candidate_keys:
-                    item = loaded.get(key)
-                    if item is None:
-                        continue
-                    payload, metadata = item
-                    if is_excluded(
-                        exclusions,
-                        metadata.get("id"),
-                        metadata.get("image_id"),
-                        metadata.get("file_name"),
-                        metadata.get("filename"),
-                    ):
-                        continue
-                    paired_text, all_texts = _paired_text(metadata)
-                    global_index = source_index + len(committed) + len(pending)
-                    suffix = Path(image_members[key].name).suffix.lower()
-                    image_id = f"gpic_{split}_{global_index:09d}_{_safe_id(Path(key).name)[:40]}"
-                    if image_id in existing_ids:
-                        continue
-                    row = {
-                        "image_id": image_id,
-                        "source_context": {
-                            "source_dataset": repo_id,
-                            "source": "gpic",
-                            "split": split,
-                            "hf_tar": repo_tar,
-                            "pair_key": key,
-                            "paired_text": paired_text,
-                            "all_texts": all_texts,
-                        },
-                    }
-                    pending.append({"row": row, "suffix": suffix, "bytes": payload})
-                    existing_keys.add(key)
-                    existing_ids.add(image_id)
-                    if len(pending) == unit_size:
-                        rows, _ = _write_source_unit(
-                            root,
-                            unit_index + units_added,
-                            source_index + len(committed),
-                            pending,
-                        )
-                        committed.extend(rows)
-                        pending = []
-                        units_added += 1
-                next_tar_index = tar_index
-                next_key_index = cursor
-            if cursor >= len(keys):
-                next_tar_index = tar_index + 1
-                next_key_index = 0
-        tar_index = next_tar_index
-        key_index = next_key_index
-
-    if pending:
-        rows, _ = _write_source_unit(
-            root,
-            unit_index + units_added,
-            source_index + len(committed),
-            pending,
-        )
+    def drain_one() -> None:
+        rows, _ = inflight.popleft().result()
         committed.extend(rows)
-        units_added += 1
+        if len(committed) % max(unit_size, 128 * unit_size) == 0:
+            print(
+                f"[materialize] committed_images={len(committed)}/{requested} "
+                f"units={len(committed) // unit_size} writers={write_workers}",
+                flush=True,
+            )
+
+    def submit_unit(items: list[dict[str, Any]]) -> None:
+        nonlocal units_submitted, next_write_offset
+        inflight.append(
+            executor.submit(
+                _write_source_unit,
+                root,
+                unit_index + units_submitted,
+                source_index + next_write_offset,
+                list(items),
+            )
+        )
+        units_submitted += 1
+        next_write_offset += len(items)
+        if len(inflight) >= 2 * write_workers:
+            drain_one()
+
+    try:
+        while tar_index < len(tar_paths) and accepted_count < requested:
+            if max_tars is not None and inspected_tars >= int(max_tars):
+                break
+            repo_tar = tar_paths[tar_index]
+            local_tar = _download_tar(repo_id, repo_tar, token, cache_dir)
+            inspected_tars += 1
+            with tarfile.open(local_tar, "r") as archive:
+                json_members: dict[str, tarfile.TarInfo] = {}
+                image_members: dict[str, tarfile.TarInfo] = {}
+                for member in archive.getmembers():
+                    if not member.isfile():
+                        continue
+                    key, suffix = _member_key(member.name)
+                    if suffix == ".json":
+                        json_members[key] = member
+                    elif suffix in IMAGE_SUFFIXES:
+                        image_members[key] = member
+                keys = _stable_key_order(
+                    sorted(set(json_members) & set(image_members)), seed, repo_tar
+                )
+                cursor = key_index if tar_index == int(selection.get("tar_index") or 0) else 0
+                while cursor < len(keys) and accepted_count < requested:
+                    remaining = requested - accepted_count
+                    candidate_keys: list[str] = []
+                    while cursor < len(keys) and len(candidate_keys) < remaining:
+                        key = keys[cursor]
+                        cursor += 1
+                        if key not in existing_keys and not is_excluded(
+                            exclusions,
+                            key,
+                            image_members[key].name,
+                            json_members[key].name,
+                        ):
+                            candidate_keys.append(key)
+
+                    # Selection still uses the exact seeded random order above.
+                    # Only physical reads are reordered; emit rows in the original
+                    # selection order so IDs and cursor semantics stay unchanged.
+                    loaded: dict[str, tuple[bytes, dict[str, Any]]] = {}
+                    for key in _physical_key_order(candidate_keys, image_members, json_members):
+                        extracted = archive.extractfile(image_members[key])
+                        if extracted is None:
+                            continue
+                        payload = extracted.read()
+                        try:
+                            with Image.open(__import__("io").BytesIO(payload)) as image:
+                                image.verify()
+                        except Exception:
+                            continue
+                        loaded[key] = (payload, _json_member(archive, json_members[key]))
+
+                    for key in candidate_keys:
+                        if accepted_count >= requested:
+                            break
+                        item = loaded.get(key)
+                        if item is None:
+                            continue
+                        payload, metadata = item
+                        if is_excluded(
+                            exclusions,
+                            metadata.get("id"),
+                            metadata.get("image_id"),
+                            metadata.get("file_name"),
+                            metadata.get("filename"),
+                        ):
+                            continue
+                        paired_text, all_texts = _paired_text(metadata)
+                        global_index = source_index + accepted_count
+                        suffix = Path(image_members[key].name).suffix.lower()
+                        image_id = f"gpic_{split}_{global_index:09d}_{_safe_id(Path(key).name)[:40]}"
+                        if image_id in existing_ids:
+                            continue
+                        row = {
+                            "image_id": image_id,
+                            "source_context": {
+                                "source_dataset": repo_id,
+                                "source": "gpic",
+                                "split": split,
+                                "hf_tar": repo_tar,
+                                "pair_key": key,
+                                "paired_text": paired_text,
+                                "all_texts": all_texts,
+                            },
+                        }
+                        pending.append({"row": row, "suffix": suffix, "bytes": payload})
+                        accepted_count += 1
+                        existing_keys.add(key)
+                        existing_ids.add(image_id)
+                        if len(pending) == unit_size:
+                            submit_unit(pending)
+                            pending = []
+                    next_tar_index = tar_index
+                    next_key_index = cursor
+                if cursor >= len(keys):
+                    next_tar_index = tar_index + 1
+                    next_key_index = 0
+            tar_index = next_tar_index
+            key_index = next_key_index
+
+        if pending:
+            submit_unit(pending)
+            pending = []
+        while inflight:
+            drain_one()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
     if len(committed) < requested:
         raise RuntimeError(
             f"GPIC materialization committed {len(committed)} of {requested} requested images; "
@@ -296,4 +338,4 @@ def extend_from_gpic(
     selection["last_commit_at"] = __import__("datetime").datetime.now(
         __import__("datetime").timezone.utc
     ).isoformat()
-    return _commit_extension(root, registry, extension, committed, units_added)
+    return _commit_extension(root, registry, extension, committed, units_submitted)

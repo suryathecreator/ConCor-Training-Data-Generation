@@ -6,10 +6,15 @@ CAMPAIGN_ROOT="${CAMPAIGN_ROOT:?CAMPAIGN_ROOT is required}"
 HF_REPO_ID="${HF_REPO_ID:-suryadv/gpic-bcc-sam3-qwen38-27b}"
 VLLM_PYTHON="${VLLM_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 HF_CLI="${HF_CLI:-$REPO_ROOT/.venv/bin/hf}"
+TOKEN_FILE="${TOKEN_FILE:-}"
 EXPORT_DIR="${EXPORT_DIR:-$CAMPAIGN_ROOT/hf_export}"
 SCAFFOLD="$REPO_ROOT/hf_dataset"
 
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+if [ -n "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
+  HF_TOKEN="$(<"$TOKEN_FILE")"
+  export HF_TOKEN
+fi
 mkdir -p "$EXPORT_DIR"
 rsync -a "$SCAFFOLD/" "$EXPORT_DIR/"
 "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-export-hf \
