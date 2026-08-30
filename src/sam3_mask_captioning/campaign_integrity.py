@@ -349,7 +349,14 @@ def _affected_stages(from_stage: str) -> tuple[str, ...]:
 
 
 def _owned_paths(unit: Path, stage: str) -> list[Path]:
-    values = [unit / value for value in STAGE_OUTPUTS.get(stage, ())]
+    # ``mask_rle.jsonl`` is repeated in the BCC merge schema because BCC
+    # publishes it, but the durable file is produced and owned by SAM3. A
+    # downstream rewind must never remove that upstream input.
+    values = [
+        unit / value
+        for value in STAGE_OUTPUTS.get(stage, ())
+        if value != "mask_rle.jsonl" or stage == "sam3"
+    ]
     values.extend(unit / value for value in STAGE_EXTRA_OUTPUTS.get(stage, ()))
     values.append(unit / "stages" / stage)
     return values

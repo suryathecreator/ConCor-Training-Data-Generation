@@ -398,6 +398,37 @@ class CampaignRecoveryTests(unittest.TestCase):
             self.assertFalse((unit / "stages" / "sam3" / "_SUCCESS.json").exists())
             self.assertTrue((backup / "repair.json").exists())
 
+    def test_consistency_repair_preserves_upstream_mask_rle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "source.png"
+            Image.new("RGB", (8, 8), (1, 2, 3)).save(image)
+            manifest = root / "manifest.jsonl"
+            write_jsonl([{"image_id": "image", "image_path": str(image)}], manifest)
+            campaign = root / "campaign"
+            initialize_campaign(campaign, unit_size=1)
+            extend_from_manifest(campaign, manifest, target_total=1)
+            unit = campaign / "units" / "000000"
+            write_jsonl(
+                [{"image_id": "image", "mask_id": "mask", "rle": {"data": "eA=="}}],
+                unit / "mask_rle.jsonl",
+            )
+            write_jsonl([], unit / "consistent_captions.jsonl")
+            write_json(
+                {"stage": "consistency"},
+                unit / "stages" / "consistency" / "_SUCCESS.json",
+            )
+
+            repair_campaign_units(
+                campaign,
+                unit_ids=[0],
+                from_stage="consistency",
+                apply=True,
+                backup_root=root / "backup",
+            )
+            self.assertTrue((unit / "mask_rle.jsonl").exists())
+            self.assertFalse((unit / "consistent_captions.jsonl").exists())
+
     def test_attempt_limit_is_persistent_and_merge_reports_quarantine(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
