@@ -39,3 +39,7 @@ For two-GPU 48 GB-class nodes, use the A40 profile with `A40_TP=2` and `A40_GRES
 ## Resume and append
 
 Rerunning the launcher against the same `CAMPAIGN_ROOT` skips durable stage checkpoints. To add more source images, increase `TARGET_TOTAL`; the manifest extension is append-only and existing image IDs/pair keys are deduplicated. Workers stop claiming new units before walltime, finish and fsync the active unit, then successor arrays resume remaining claims.
+
+Claims are heartbeated every 60 seconds. A different allocation can recover a claim only after Slurm reports the owner inactive and the orphan grace has elapsed; a requeued instance of the exact same array task may resume immediately. Stale inspection and replacement happen under one stage lock, and fencing tokens stop an old process from committing or cleaning after ownership changes.
+
+Before resuming from suspected storage or preemption damage, run `concor campaign-integrity`. Use `campaign-repair` to rewind only reported units, then set `START_STAGE` to the earliest repaired stage. Quarantined units require an explicit repair; adding more continuation arrays will not silently retry them.

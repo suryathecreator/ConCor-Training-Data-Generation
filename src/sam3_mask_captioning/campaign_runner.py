@@ -5,8 +5,6 @@ import base64
 import json
 import os
 import shutil
-import socket
-import subprocess
 import time
 import traceback
 import zlib
@@ -19,6 +17,16 @@ from PIL import Image
 
 from .artifact_store import hydrate_archive, pack_artifacts, remove_hydrated_files
 from .bcc_canonicalization import canonicalize_bcc_rows
+from .campaign_claims import (
+    ClaimHandle,
+    ClaimHeartbeat,
+    ClaimOwnershipLost,
+    commit_claim_json,
+    finish_claim,
+    run_if_claim_owned,
+    try_claim,
+)
+from .campaign_integrity import assert_bcc_integrity, assert_sam3_integrity
 from .campaign_manifest import campaign_paths, load_registry
 from .caption_stage import create_captioner, run_captioning, run_mask_review
 from .consistency_stage import run_sam3_consistency
@@ -91,87 +99,6 @@ def _prerequisite_satisfied(unit_dir: Path, stage: str) -> bool:
         return True
     alternatives = (prerequisite,) if isinstance(prerequisite, str) else prerequisite
     return any(_success_path(unit_dir, candidate).exists() for candidate in alternatives)
-
-
-def _claim_path(campaign_root: Path, stage: str, unit_id: int) -> Path:
-    return campaign_root / "claims" / stage / f"{unit_id:06d}.claim"
-
-
-def _slurm_job_is_active(job_id: str) -> bool:
-    """Return whether a Slurm allocation still has a live/suspended process."""
-    if not job_id or job_id == "local":
-        return True
-    try:
-        result = subprocess.run(
-            ["squeue", "-h", "-j", job_id, "-o", "%T"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        # Fail closed if Slurm itself is unavailable; the time lease remains a
-        # safe fallback and prevents two workers from processing one unit.
-        return True
-    states = {line.strip().upper() for line in result.stdout.splitlines() if line.strip()}
-    return bool(states & {"RUNNING", "COMPLETING", "CONFIGURING", "SUSPENDED", "STOPPED"})
-
-
-def _try_claim(
-    campaign_root: Path,
-    stage: str,
-    unit_id: int,
-    *,
-    worker_id: str,
-    lease_seconds: int,
-) -> Path | None:
-    claim = _claim_path(campaign_root, stage, unit_id)
-    claim.parent.mkdir(parents=True, exist_ok=True)
-    reclaim = False
-    if claim.exists():
-        try:
-            prior = json.loads(claim.read_text(encoding="utf-8"))
-        except Exception:
-            prior = {}
-        prior_job = str(prior.get("worker_id") or "").split(":", 1)[0]
-        current_job = str(worker_id).split(":", 1)[0]
-        same_requeued_job = current_job != "local" and prior_job == current_job
-        orphaned_slurm_process = (
-            prior_job not in {"", "local"} and not _slurm_job_is_active(prior_job)
-        )
-        try:
-            lease_expired = time.time() - claim.stat().st_mtime > lease_seconds
-        except FileNotFoundError:
-            # The owner can complete and release the claim between exists(),
-            # read_text(), and stat(). In that case proceed directly to the
-            # atomic O_EXCL acquisition below; a competing worker still wins
-            # safely if it recreates the claim first.
-            lease_expired = False
-        reclaim = same_requeued_job or orphaned_slurm_process or lease_expired
-    if reclaim:
-        stale = claim.with_suffix(f".stale.{int(time.time())}.{os.getpid()}")
-        try:
-            os.replace(claim, stale)
-        except FileNotFoundError:
-            pass
-    payload = json.dumps(
-        {
-            "worker_id": worker_id,
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "claimed_at": time.time(),
-        },
-        sort_keys=True,
-    ).encode("utf-8")
-    try:
-        fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        return None
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    return claim
 
 
 def _unit_config(config: dict[str, Any], unit_dir: Path) -> dict[str, Any]:
@@ -550,7 +477,12 @@ def _run_stage(
         path = run_sam3(config, unit_dir, processor_override=processor)
         _add_rle(unit_dir)
         artifact = pack_artifacts(unit_dir, ["masks", "inverse_crops"], unit_dir / "artifacts" / "sam3.tar")
-        return {"row_count": len(read_jsonl(path)) if path.exists() else 0, "artifact": artifact}
+        integrity = assert_sam3_integrity(unit_dir)
+        return {
+            "row_count": len(read_jsonl(path)) if path.exists() else 0,
+            "artifact": artifact,
+            "integrity": integrity,
+        }
     if stage == "mask-caption":
         mask_rows = (
             read_jsonl(unit_dir / "sam3_masks.jsonl")
@@ -639,7 +571,12 @@ def _run_stage(
             ["correspondence_overlays"],
             unit_dir / "artifacts" / "bcc.tar",
         )
-        return {"row_count": len(read_jsonl(path)) if path.exists() else 0, "artifact": artifact}
+        integrity = assert_bcc_integrity(unit_dir)
+        return {
+            "row_count": len(read_jsonl(path)) if path.exists() else 0,
+            "artifact": artifact,
+            "integrity": integrity,
+        }
     if stage == "bcc-rewrite":
         captioner = resource("captioner", lambda: create_captioner(config, "image_caption_qa"))
         canonical = unit_dir / "bcc_canonical_captions.jsonl"
@@ -672,14 +609,79 @@ def _run_stage(
             ["correspondence_overlays"],
             unit_dir / "artifacts" / "bcc.tar",
         )
+        integrity = assert_bcc_integrity(unit_dir)
         audits = unit_dir / "bcc_validation_audit.jsonl"
         return {
             "row_count": len(read_jsonl(path)) if path.exists() else 0,
             "audit_count": len(read_jsonl(audits)) if audits.exists() else 0,
             "shared_qwen_engine": True,
             "artifact": artifact,
+            "integrity": integrity,
         }
     raise ValueError(f"Unknown campaign stage: {stage}")
+
+
+def _attempt_state_path(unit_dir: Path, stage: str) -> Path:
+    return _stage_dir(unit_dir, stage) / "attempt-state.json"
+
+
+def _quarantine_path(unit_dir: Path, stage: str) -> Path:
+    return _stage_dir(unit_dir, stage) / "_QUARANTINED.json"
+
+
+def _persistent_attempt_count(unit_dir: Path, stage: str) -> int:
+    path = _attempt_state_path(unit_dir, stage)
+    if not path.exists():
+        return 0
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("attempt_count") or 0)
+    except Exception:
+        return 0
+
+
+def _record_stage_failure(
+    unit_dir: Path,
+    stage: str,
+    *,
+    worker_id: str,
+    claim_token: str,
+    max_unit_attempts: int,
+    exc: Exception,
+) -> int:
+    stage_dir = _stage_dir(unit_dir, stage)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    attempt = _persistent_attempt_count(unit_dir, stage) + 1
+    payload = {
+        "stage": stage,
+        "unit_id": int(unit_dir.name),
+        "worker_id": worker_id,
+        "claim_token": claim_token,
+        "attempt_count": attempt,
+        "max_unit_attempts": max_unit_attempts,
+        "failed_at": time.time(),
+        "error": repr(exc),
+        "traceback": traceback.format_exc(),
+    }
+    write_json(payload, stage_dir / f"attempt-{time.time_ns()}-{claim_token[:12]}.error.json")
+    write_json(payload, _attempt_state_path(unit_dir, stage))
+    if attempt >= max_unit_attempts:
+        write_json(
+            {
+                **payload,
+                "quarantined": True,
+                "reason": "persistent_unit_attempt_limit_reached",
+            },
+            _quarantine_path(unit_dir, stage),
+        )
+    return attempt
+
+
+def _clear_attempt_state(unit_dir: Path, stage: str) -> None:
+    for path in (_attempt_state_path(unit_dir, stage), _quarantine_path(unit_dir, stage)):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def run_stage_worker(
@@ -690,13 +692,17 @@ def run_stage_worker(
     worker_index: int = 0,
     max_units: int | None = None,
     lease_seconds: int = 21_600,
+    heartbeat_seconds: float = 60.0,
+    orphan_grace_seconds: int = 120,
     max_unit_attempts: int = 3,
     stop_claiming_at_epoch: float | None = None,
 ) -> dict[str, Any]:
     if stage not in STAGES:
         raise ValueError(f"Unknown stage {stage}; expected one of {STAGES}")
     campaign_root = Path(campaign_root).expanduser().resolve()
-    worker_id = f"{os.environ.get('SLURM_JOB_ID', 'local')}:{os.environ.get('SLURM_ARRAY_TASK_ID', worker_index)}:{os.getpid()}"
+    slurm_job = os.environ.get("SLURM_ARRAY_JOB_ID") or os.environ.get("SLURM_JOB_ID") or "local"
+    slurm_task = os.environ.get("SLURM_ARRAY_TASK_ID", str(worker_index))
+    worker_id = f"{slurm_job}:{slurm_task}:{os.getpid()}"
     units = _unit_ids(campaign_root)
     if units:
         rotate = int(worker_index) % len(units)
@@ -705,26 +711,29 @@ def run_stage_worker(
     completed_count = 0
     failed_units: list[int] = []
     drained = False
-    attempt_counts: dict[int, int] = defaultdict(int)
+    max_attempts = max(1, int(max_unit_attempts))
     while max_units is None or completed_count < int(max_units):
         if stop_claiming_at_epoch is not None and time.time() >= stop_claiming_at_epoch:
             drained = True
             break
-        claimed: tuple[int, Path] | None = None
+        claimed: tuple[int, ClaimHandle] | None = None
         for unit_id in units:
-            if attempt_counts[unit_id] >= max(1, int(max_unit_attempts)):
-                continue
             unit_dir = _unit_dir(campaign_root, unit_id)
             if _success_path(unit_dir, stage).exists():
                 continue
+            if _quarantine_path(unit_dir, stage).exists():
+                continue
+            if _persistent_attempt_count(unit_dir, stage) >= max_attempts:
+                continue
             if not _prerequisite_satisfied(unit_dir, stage):
                 continue
-            claim = _try_claim(
+            claim = try_claim(
                 campaign_root,
                 stage,
                 unit_id,
                 worker_id=worker_id,
                 lease_seconds=lease_seconds,
+                orphan_grace_seconds=orphan_grace_seconds,
             )
             if claim is not None:
                 claimed = unit_id, claim
@@ -735,14 +744,16 @@ def run_stage_worker(
         unit_dir = _unit_dir(campaign_root, unit_id)
         stage_dir = _stage_dir(unit_dir, stage)
         stage_dir.mkdir(parents=True, exist_ok=True)
+        heartbeat = ClaimHeartbeat(claim, interval_seconds=heartbeat_seconds).start()
         hydrated: list[str] = []
         node_hydration_base = os.environ.get("BCC_NODE_HYDRATION_ROOT", "").strip()
         hydration_root = (
-            Path(node_hydration_base) / stage / f"{unit_id:06d}"
+            Path(node_hydration_base) / stage / f"{unit_id:06d}" / claim.token
             if node_hydration_base
             else None
         )
         started = time.perf_counter()
+        committed = False
         try:
             hydrated = _hydrate_for_stage(
                 unit_dir,
@@ -751,46 +762,59 @@ def run_stage_worker(
             )
             unit_config = _unit_config(config, unit_dir)
             details = _run_stage(stage, unit_config, unit_dir, runtime)
+            heartbeat.assert_owned()
             payload = {
                 "stage": stage,
                 "unit_id": unit_id,
                 "worker_id": worker_id,
+                "claim_token": claim.token,
+                "claim_generation": claim.generation,
                 "elapsed_seconds": time.perf_counter() - started,
                 "completed_at": time.time(),
                 "details": details,
                 "input_manifest_sha256": sha256_file(unit_dir / "selected_images.jsonl"),
             }
-            write_json(payload, _success_path(unit_dir, stage))
             _fsync_unit_outputs(unit_dir)
+            commit_claim_json(claim, _success_path(unit_dir, stage), payload)
+            committed = True
+            try:
+                _clear_attempt_state(unit_dir, stage)
+            except OSError:
+                # The stage commit is already durable. Stale attempt metadata
+                # is diagnostic and must not downgrade a successful unit.
+                pass
             completed_count += 1
-            if stage == "sam3":
-                remove_hydrated_files(unit_dir, ["masks", "inverse_crops"])
-            if stage == "bcc-draft":
-                remove_hydrated_files(unit_dir, ["correspondence_overlays"])
-            if stage == "bcc":
-                remove_hydrated_files(unit_dir, ["correspondence_overlays"])
         except Exception as exc:
             failed_units.append(unit_id)
-            attempt_counts[unit_id] += 1
-            write_json(
-                {
-                    "stage": stage,
-                    "unit_id": unit_id,
-                    "worker_id": worker_id,
-                    "worker_attempt": attempt_counts[unit_id],
-                    "max_unit_attempts": max(1, int(max_unit_attempts)),
-                    "failed_at": time.time(),
-                    "error": repr(exc),
-                    "traceback": traceback.format_exc(),
-                },
-                stage_dir / f"attempt-{int(time.time())}.error.json",
-            )
+            if not isinstance(exc, ClaimOwnershipLost):
+                run_if_claim_owned(
+                    claim,
+                    lambda: _record_stage_failure(
+                        unit_dir,
+                        stage,
+                        worker_id=worker_id,
+                        claim_token=claim.token,
+                        max_unit_attempts=max_attempts,
+                        exc=exc,
+                    ),
+                )
         finally:
-            _cleanup_stage_hydration(unit_dir, hydrated, hydration_root)
-            try:
-                claim.unlink()
-            except FileNotFoundError:
-                pass
+            heartbeat.stop()
+
+            def cleanup_owned_artifacts() -> None:
+                cleanup_names = list(hydrated)
+                if committed and stage == "sam3":
+                    cleanup_names.extend(("masks", "inverse_crops"))
+                if committed and stage in {"bcc-draft", "bcc"}:
+                    cleanup_names.append("correspondence_overlays")
+                _cleanup_stage_hydration(unit_dir, cleanup_names, hydration_root)
+
+            cleaned_and_released = finish_claim(
+                claim,
+                cleanup_owned_artifacts,
+            )
+            if not cleaned_and_released and hydration_root is not None:
+                shutil.rmtree(hydration_root, ignore_errors=True)
     return {
         "stage": stage,
         "worker_id": worker_id,
@@ -806,13 +830,20 @@ def merge_stage(campaign_root: str | Path, stage: str) -> dict[str, Any]:
         raise ValueError(stage)
     campaign_root = Path(campaign_root).expanduser().resolve()
     missing: list[int] = []
+    quarantined: list[int] = []
     successes: list[dict[str, Any]] = []
     for unit_id in _unit_ids(campaign_root):
         path = _success_path(_unit_dir(campaign_root, unit_id), stage)
         if not path.exists():
             missing.append(unit_id)
+            if _quarantine_path(_unit_dir(campaign_root, unit_id), stage).exists():
+                quarantined.append(unit_id)
         else:
             successes.append(json.loads(path.read_text(encoding="utf-8")))
+    if quarantined:
+        raise RuntimeError(
+            f"Stage {stage} has {len(quarantined)} quarantined unit(s): {quarantined[:20]}"
+        )
     if missing:
         raise RuntimeError(
             f"Stage {stage} is incomplete for {len(missing)} unit(s): {missing[:20]}"
@@ -870,10 +901,15 @@ def campaign_status(campaign_root: str | Path) -> dict[str, Any]:
                 )
         claims_dir = campaign_root / "claims" / stage
         active_claims = sum(1 for _ in claims_dir.glob("*.claim")) if claims_dir.exists() else 0
+        quarantined = sum(
+            int(_quarantine_path(_unit_dir(campaign_root, unit_id), stage).exists())
+            for unit_id in range(unit_count)
+        )
         stages[stage] = {
             "complete_units": complete,
             "total_units": unit_count,
             "active_claims": active_claims,
+            "quarantined_units": quarantined,
             "failed_attempts": failed_attempts,
             "merged": (campaign_root / "stages" / stage / "_MERGED.json").exists(),
         }

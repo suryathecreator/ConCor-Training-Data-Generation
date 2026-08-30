@@ -125,6 +125,8 @@ def main() -> None:
     campaign_worker.add_argument("--worker-index", type=int, default=0)
     campaign_worker.add_argument("--max-units", type=int, default=None)
     campaign_worker.add_argument("--lease-seconds", type=int, default=21600)
+    campaign_worker.add_argument("--heartbeat-seconds", type=float, default=60.0)
+    campaign_worker.add_argument("--orphan-grace-seconds", type=int, default=120)
     campaign_worker.add_argument("--max-unit-attempts", type=int, default=3)
     campaign_worker.add_argument("--stop-claiming-at-epoch", type=float, default=None)
 
@@ -151,6 +153,22 @@ def main() -> None:
 
     campaign_status_parser = sub.add_parser("campaign-status")
     campaign_status_parser.add_argument("campaign_root")
+
+    campaign_integrity = sub.add_parser("campaign-integrity")
+    campaign_integrity.add_argument("campaign_root")
+    campaign_integrity.add_argument("--stage", action="append", choices=["sam3", "bcc"])
+    campaign_integrity.add_argument("--unit-id", action="append", type=int)
+    campaign_integrity.add_argument("--report", default=None)
+    campaign_integrity.add_argument("--workers", type=int, default=16)
+
+    campaign_repair = sub.add_parser("campaign-repair")
+    campaign_repair.add_argument("campaign_root")
+    campaign_repair.add_argument("--unit-id", action="append", type=int)
+    campaign_repair.add_argument("--report", default=None)
+    campaign_repair.add_argument("--from-stage", choices=STAGES, required=True)
+    campaign_repair.add_argument("--backup-root", default=None)
+    campaign_repair.add_argument("--reason", default="integrity_repair")
+    campaign_repair.add_argument("--apply", action="store_true")
 
     vllm_canary = sub.add_parser("vllm-canary")
     vllm_canary.add_argument("fixture_run")
@@ -257,6 +275,41 @@ def main() -> None:
 
         print(json.dumps(campaign_status(args.campaign_root), indent=2, sort_keys=True))
         return
+    if args.command == "campaign-integrity":
+        from .campaign_integrity import audit_campaign_integrity
+
+        result = audit_campaign_integrity(
+            args.campaign_root,
+            stages=args.stage or ("sam3", "bcc"),
+            unit_ids=args.unit_id,
+            report_path=args.report,
+            workers=args.workers,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if not result["valid"]:
+            raise SystemExit(1)
+        return
+    if args.command == "campaign-repair":
+        from pathlib import Path
+
+        from .campaign_integrity import repair_campaign_units
+
+        unit_ids = list(args.unit_id or [])
+        if args.report:
+            report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+            unit_ids.extend(int(row["unit_id"]) for row in report.get("violations") or [])
+        if not unit_ids:
+            parser.error("campaign-repair requires --unit-id or an integrity --report")
+        result = repair_campaign_units(
+            args.campaign_root,
+            unit_ids=unit_ids,
+            from_stage=args.from_stage,
+            apply=args.apply,
+            backup_root=args.backup_root,
+            reason=args.reason,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     if args.command == "summarize":
         from .summarize import summarize_run
 
@@ -326,6 +379,8 @@ def main() -> None:
                     worker_index=args.worker_index,
                     max_units=args.max_units,
                     lease_seconds=args.lease_seconds,
+                    heartbeat_seconds=args.heartbeat_seconds,
+                    orphan_grace_seconds=args.orphan_grace_seconds,
                     max_unit_attempts=args.max_unit_attempts,
                     stop_claiming_at_epoch=args.stop_claiming_at_epoch,
                 ),

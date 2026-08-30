@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from .io_utils import append_jsonl, read_jsonl, read_jsonl_indexed, write_jsonl
+from .io_utils import append_jsonl, read_jsonl, write_jsonl
 from .mask_utils import (
     bbox_area,
     bbox_intersection_area,
@@ -174,16 +174,79 @@ def _sparse_component_rejects(
     return kept, rejected
 
 
-def _existing_image_ids(paths: list[Path]) -> set[str]:
-    ids: set[str] = set()
-    for path in paths:
+def _dedupe_completed_images(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    rows = read_jsonl(path)
+    latest: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in rows:
+        image_id = str(row.get("image_id") or "").strip()
+        if not image_id:
+            continue
+        if image_id not in latest:
+            order.append(image_id)
+        latest[image_id] = row
+    if len(rows) != len(latest):
+        write_jsonl((latest[image_id] for image_id in order), path)
+    return set(latest)
+
+
+def _purge_incomplete_image(run_dir: Path, image_id: str) -> None:
+    """Remove non-committed SAM3 rows/files before an image-level retry."""
+    canonical_streams = (
+        "sam3_masks.jsonl",
+        "sam3_rejected_masks.jsonl",
+        "sam3_raw.jsonl",
+        "sam3_prompt_batch_metrics.jsonl",
+    )
+    for filename in canonical_streams:
+        path = run_dir / filename
         if not path.exists():
             continue
-        for row in read_jsonl_indexed(path):
-            image_id = str(row.get("image_id") or "").strip()
-            if image_id:
-                ids.add(image_id)
-    return ids
+        rows = read_jsonl(path)
+        kept = [row for row in rows if str(row.get("image_id") or "") != image_id]
+        if len(kept) != len(rows):
+            write_jsonl(kept, path)
+    prefix = f"{sanitize_id(image_id)}_"
+    for directory in (
+        "masks",
+        "inverse_crops",
+        "overlays",
+        "crop_overlays",
+        "crop_images",
+    ):
+        root = run_dir / directory
+        if not root.is_dir():
+            continue
+        for path in root.glob(f"{prefix}*"):
+            if path.is_file():
+                path.unlink()
+    overview = run_dir / "sam3_all_masks" / f"{sanitize_id(image_id)}.jpg"
+    try:
+        overview.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _dedupe_mask_manifest(path: Path) -> None:
+    if not path.exists():
+        return
+    rows = read_jsonl(path)
+    latest: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    passthrough: list[dict[str, Any]] = []
+    for row in rows:
+        mask_id = str(row.get("mask_id") or "").strip()
+        if not mask_id:
+            passthrough.append(row)
+            continue
+        if mask_id not in latest:
+            order.append(mask_id)
+        latest[mask_id] = row
+    canonical = [latest[mask_id] for mask_id in order] + passthrough
+    if len(canonical) != len(rows):
+        write_jsonl(canonical, path)
 
 
 def _load_processor(config: dict[str, Any]):
@@ -492,8 +555,11 @@ def run_sam3(
     filter_config = config.get("filter", {})
     resume = bool(config.get("resume", False) or sam3_config.get("resume", False))
     if resume:
-        completed_ids = _existing_image_ids([completed_path])
+        completed_ids = _dedupe_completed_images(completed_path)
         reviews = [row for row in reviews if str(row.get("image_id") or "") not in completed_ids]
+        for review in reviews:
+            _purge_incomplete_image(run_dir, str(review.get("image_id") or ""))
+        _dedupe_mask_manifest(masks_path)
     else:
         for stale in (masks_path, rejected_path, raw_path, completed_path, failed_path, errors_path):
             if stale.exists():
@@ -684,10 +750,19 @@ def run_sam3(
                     "reject_detail": candidate.get("reject_detail", {}),
                 }
                 append_jsonl(row, rejected_path)
-            append_jsonl({"image_id": image_id, "kept": len(kept), "rejected": len(rejected)}, completed_path)
+            append_jsonl(
+                {"image_id": image_id, "kept": len(kept), "rejected": len(rejected)},
+                completed_path,
+                durable=True,
+            )
         except Exception as exc:
             failed_count += 1
-            append_jsonl({"image_id": image_id, "error": repr(exc)}, failed_path)
+            _purge_incomplete_image(run_dir, image_id)
+            append_jsonl(
+                {"image_id": image_id, "error": repr(exc)},
+                failed_path,
+                durable=True,
+            )
             append_jsonl(
                 {
                     "image_id": image_id,
@@ -696,6 +771,7 @@ def run_sam3(
                     "traceback": traceback.format_exc(),
                 },
                 errors_path,
+                durable=True,
             )
             if not config.get("continue_on_error", True):
                 raise
@@ -705,4 +781,5 @@ def run_sam3(
         and bool(sam3_config.get("fail_if_all_attempts_error", True))
     ):
         raise RuntimeError(f"SAM3 failed for all {attempted_count} attempted images; see {errors_path}")
+    _dedupe_mask_manifest(masks_path)
     return masks_path

@@ -59,6 +59,28 @@ Training examples are separated by **mask count only**, not by audit style flags
 
 Every run also produces `reports/run_ledger.csv`, `run_ledger.jsonl`, and a summary. Stage outputs are concatenated after each barrier; files roll into numbered shards only after the configured size limit.
 
+## Checkpoints and recovery
+
+Unit claims are fenced for the full stage transaction: stale-claim replacement is serialized, live claims are heartbeated, and every commit, cleanup, and release verifies the worker's unique ownership token. SAM 3 also checks that its manifest, mask PNGs, inverse crops, RLE rows, and packed archive agree exactly before writing `_SUCCESS.json`.
+
+Audit a campaign without changing it:
+
+```bash
+concor campaign-integrity outputs/campaigns/my_run \
+  --report outputs/campaigns/my_run/reports/integrity.json
+```
+
+If the report identifies a damaged unit, preview a recoverable rewind and then apply it. Source images and completed upstream review data are preserved; affected outputs are moved into a timestamped `repairs/` backup.
+
+```bash
+concor campaign-repair outputs/campaigns/my_run \
+  --report outputs/campaigns/my_run/reports/integrity.json --from-stage sam3
+concor campaign-repair outputs/campaigns/my_run \
+  --report outputs/campaigns/my_run/reports/integrity.json --from-stage sam3 --apply
+```
+
+Then rerun the normal launcher with `START_STAGE=sam3`. Only rewound units repeat the upstream stages. Persistent failures are quarantined with an explicit diagnostic instead of being retried indefinitely.
+
 ## Quality, honestly
 
 The output is useful but not perfect. Based on our audits, it is roughly 80–90% good; a small manual cleanup pass would still help. The deterministic checks are a strong approximation built from repeated scorer iterations, but they can miss a real issue or flag something harmless. The Qwen visual auditor is also better at improving the caption than at citing exact mask numbers in its explanation, so those explanations should not be treated as ground truth.
