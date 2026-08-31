@@ -76,6 +76,10 @@ QWEN_STAGES = frozenset(
 SAM3_STAGES = frozenset({"sam3", "consistency"})
 
 
+class SharedStageRuntimeError(RuntimeError):
+    """A worker-wide model/runtime initialization failure, not bad unit data."""
+
+
 def _stage_dir(unit_dir: Path, stage: str) -> Path:
     return unit_dir / "stages" / stage
 
@@ -465,7 +469,15 @@ def _run_stage(
 ) -> dict[str, Any]:
     def resource(key: str, factory: Any) -> Any:
         if key not in runtime:
-            runtime[key] = factory()
+            try:
+                runtime[key] = factory()
+            except Exception as exc:
+                # Loading a shared model/runtime is allocation-wide setup. If
+                # it fails (for example, a missing Python dependency), marking
+                # the claimed unit as bad eventually quarantines healthy data.
+                raise SharedStageRuntimeError(
+                    f"Could not initialize shared stage resource {key!r}"
+                ) from exc
         return runtime[key]
 
     if stage == "image-review":
@@ -784,6 +796,11 @@ def run_stage_worker(
                 # is diagnostic and must not downgrade a successful unit.
                 pass
             completed_count += 1
+        except SharedStageRuntimeError:
+            # Release the claim in ``finally`` and fail the worker. Successor
+            # jobs may retry after the allocation/runtime is repaired, but the
+            # unit's persistent attempt count must remain unchanged.
+            raise
         except Exception as exc:
             failed_units.append(unit_id)
             if not isinstance(exc, ClaimOwnershipLost):

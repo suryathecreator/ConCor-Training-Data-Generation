@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -28,9 +29,11 @@ from sam3_mask_captioning.campaign_integrity import (
 )
 from sam3_mask_captioning.campaign_manifest import extend_from_manifest, initialize_campaign
 from sam3_mask_captioning.campaign_runner import (
+    SharedStageRuntimeError,
     _quarantine_path,
     _record_stage_failure,
     merge_stage,
+    run_stage_worker,
 )
 from sam3_mask_captioning.io_utils import read_jsonl, write_json, write_jsonl
 from sam3_mask_captioning.sam3_stage import run_sam3
@@ -453,6 +456,37 @@ class CampaignRecoveryTests(unittest.TestCase):
             self.assertTrue(_quarantine_path(unit, "sam3").exists())
             with self.assertRaisesRegex(RuntimeError, "quarantined"):
                 merge_stage(campaign, "sam3")
+
+    def test_shared_runtime_failure_does_not_quarantine_unit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "source.png"
+            Image.new("RGB", (8, 8), (1, 2, 3)).save(image)
+            manifest = root / "manifest.jsonl"
+            write_jsonl([{"image_id": "image", "image_path": str(image)}], manifest)
+            campaign = root / "campaign"
+            initialize_campaign(campaign, unit_size=1)
+            extend_from_manifest(campaign, manifest, target_total=1)
+            unit = campaign / "units" / "000000"
+            write_jsonl(
+                [{"image_id": "image", "accepted": True, "sam3_prompts": ["object"]}],
+                unit / "image_reviews.jsonl",
+            )
+            write_json(
+                {"stage": "image-review"},
+                unit / "stages" / "image-review" / "_SUCCESS.json",
+            )
+
+            with mock.patch(
+                "sam3_mask_captioning.campaign_runner._load_processor",
+                side_effect=ModuleNotFoundError("No module named 'iopath'"),
+            ):
+                with self.assertRaises(SharedStageRuntimeError):
+                    run_stage_worker({}, campaign, "sam3", max_units=1)
+
+            self.assertFalse(_quarantine_path(unit, "sam3").exists())
+            self.assertFalse((unit / "stages" / "sam3" / "attempt-state.json").exists())
+            self.assertFalse(claim_path(campaign, "sam3", 0).exists())
 
 
 if __name__ == "__main__":
