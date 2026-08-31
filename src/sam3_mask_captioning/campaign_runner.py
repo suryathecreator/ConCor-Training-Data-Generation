@@ -887,13 +887,30 @@ def wait_for_stage_merge(
     *,
     poll_seconds: int = 30,
 ) -> dict[str, Any]:
-    """Advance as soon as any combination of workers completes all units."""
+    """Advance as soon as any combination of workers completes all units.
+
+    A quarantined unit requires operator repair, but it must not make the
+    watcher exit: doing so permanently invalidates every downstream ``afterok``
+    dependency. Keep the tail resumable and merge after the quarantine is
+    repaired and the unit eventually commits.
+    """
+    last_wait_reason = ""
     while True:
         try:
             return merge_stage(campaign_root, stage)
         except RuntimeError as exc:
-            if not str(exc).startswith(f"Stage {stage} is incomplete"):
+            reason = str(exc)
+            recoverable_wait = reason.startswith(
+                f"Stage {stage} is incomplete"
+            ) or (
+                reason.startswith(f"Stage {stage} has ")
+                and " quarantined unit(s)" in reason
+            )
+            if not recoverable_wait:
                 raise
+            if reason != last_wait_reason:
+                print(f"[merge-wait] {reason}", flush=True)
+                last_wait_reason = reason
         time.sleep(max(1, int(poll_seconds)))
 
 

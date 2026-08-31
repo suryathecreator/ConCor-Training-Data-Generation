@@ -34,6 +34,7 @@ from sam3_mask_captioning.campaign_runner import (
     _record_stage_failure,
     merge_stage,
     run_stage_worker,
+    wait_for_stage_merge,
 )
 from sam3_mask_captioning.io_utils import read_jsonl, write_json, write_jsonl
 from sam3_mask_captioning.sam3_stage import run_sam3
@@ -487,6 +488,19 @@ class CampaignRecoveryTests(unittest.TestCase):
             self.assertFalse(_quarantine_path(unit, "sam3").exists())
             self.assertFalse((unit / "stages" / "sam3" / "attempt-state.json").exists())
             self.assertFalse(claim_path(campaign, "sam3", 0).exists())
+
+    def test_merge_watcher_waits_for_quarantine_repair(self):
+        completed = {"stage": "sam3", "unit_count": 1}
+        with mock.patch(
+            "sam3_mask_captioning.campaign_runner.merge_stage",
+            side_effect=[
+                RuntimeError("Stage sam3 has 1 quarantined unit(s): [0]"),
+                completed,
+            ],
+        ) as merge, mock.patch("sam3_mask_captioning.campaign_runner.time.sleep") as sleep:
+            self.assertEqual(wait_for_stage_merge("/unused", "sam3"), completed)
+        self.assertEqual(merge.call_count, 2)
+        sleep.assert_called_once()
 
 
 if __name__ == "__main__":
