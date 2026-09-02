@@ -18,7 +18,7 @@ fi
 mkdir -p "$EXPORT_DIR"
 rsync -a "$SCAFFOLD/" "$EXPORT_DIR/"
 "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-export-hf \
-  "$CAMPAIGN_ROOT" "$EXPORT_DIR" --shard-size 100
+  "$CAMPAIGN_ROOT" "$EXPORT_DIR" --shard-size 100 --no-image-bytes
 mkdir -p "$EXPORT_DIR/manifests"
 rsync -a "$CAMPAIGN_ROOT/campaign_registry.json" "$EXPORT_DIR/manifests/"
 rsync -a "$CAMPAIGN_ROOT/reports/" "$EXPORT_DIR/manifests/reports/"

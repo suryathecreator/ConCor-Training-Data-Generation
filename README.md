@@ -44,7 +44,7 @@ See [docs/DATA.md](docs/DATA.md) for the complete input/output contract and [doc
 3. **Mask caption + QA** — Qwen sees dynamically colored inverse-mask crops, writes a short identity description, and checks it against the proposal and pixels.
 4. **Consistency** — spaCy extracts the identity head, SAM 3 is prompted again in the same region, and the mask must match a returned proposal at IoU ≥ 0.5.
 5. **BCC captioning** — Qwen sees the original, numbered overlay, every inverse crop, and the accepted-mask context. It writes inline links, independently audits the pair, then performs exactly one rewrite. Deterministic checks validate syntax, span coverage, identity compatibility, and a few observed failure modes.
-6. **Publish** — units merge into bounded JSONL shards, an HTML audit site is built, a per-image CSV/JSONL ledger records every stage outcome, and Parquet views are exported.
+6. **Publish** — units merge into bounded JSONL shards, an HTML audit site is built, a per-image CSV/JSONL ledger records every stage outcome, and ConCor-1-compatible Parquet views are exported.
 
 The caption does not have to copy mask descriptions or mention every mask. A natural plural phrase can point to multiple masks, and a single mask can link to several text spans such as a noun phrase and later pronoun.
 
@@ -52,12 +52,12 @@ The caption does not have to copy mask descriptions or mention every mask. A nat
 
 Training examples are separated by **mask count only**, not by audit style flags:
 
-- `min_10_masks`: parseable BCC examples with at least 10 final linked masks.
-- `masks_1_to_9`: parseable examples with 1–9 final linked masks.
-- `parseable_1_plus`: the union of all parseable examples with at least one linked mask.
+- `gpic_min_10`: parseable BCC examples with at least 10 final linked masks.
+- `gpic_1_to_9`: parseable examples with 1–9 final linked masks.
+- `gpic_parseable_1_plus`: the union of all parseable examples with at least one linked mask.
 - `audit_all_processed`: every selected source image, including upstream rejection, zero-mask, unparseable, and failed outcomes. These audit-only rows are not training pairs.
 
-Every run also produces `reports/run_ledger.csv`, `run_ledger.jsonl`, and a summary. Stage outputs are concatenated after each barrier; files roll into numbered shards only after the configured size limit.
+The three training configs use the same nine-column caption contract as [UWGZQ/ConCor-1-Data](https://huggingface.co/datasets/UWGZQ/ConCor-1-Data): source keys and dimensions plus `caption`, `groups_json`, and compressed-COCO-RLE `masks_json`. Every run also produces `reports/run_ledger.csv`, `run_ledger.jsonl`, and a summary. Stage outputs are concatenated after each barrier; files roll into numbered shards only after the configured size limit.
 
 ## Checkpoints and recovery
 
@@ -80,6 +80,8 @@ concor campaign-repair outputs/campaigns/my_run \
 ```
 
 Then rerun the normal launcher with `START_STAGE=sam3`. Only rewound units repeat the upstream stages. Persistent failures are quarantined with an explicit diagnostic instead of being retried indefinitely.
+
+BCC packets that exceed the model's image or context limit are handled per image: that image receives `bcc_input_too_large`, while valid neighbors in its batch continue. Legacy quarantines caused by the old batch-wide behavior can be finalized explicitly with `concor campaign-skip-oversized-bcc CAMPAIGN --apply`; the recovery report and prior quarantine metadata remain under `repairs/`.
 
 ## Quality, honestly
 

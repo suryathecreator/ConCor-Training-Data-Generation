@@ -33,7 +33,9 @@ After every stage barrier:
 - `reports/run_ledger.csv` and `.jsonl` contain one source image per row with image review, SAM proposal, mask QA, consistency, BCC, count, and disposition fields.
 - `reports/run_ledger_summary.json` provides compact totals.
 
-The Hugging Face export uses Parquet shards (100 rows by default) with image bytes for parseable training examples, COCO-style mask RLE JSON, caption spans/groups, counts, disposition, and full BCC audit JSON. Zero-mask and unparseable rows remain metadata-only in `audit_all_processed` and are never training examples.
+The Hugging Face export writes three training configs in the nine-column ConCor-1 caption format: `dataset`, `split`, `image_key`, `image_id`, `height`, `width`, `caption`, `groups_json`, and `masks_json`. `groups_json` stores half-open caption spans and linked instance IDs; `masks_json` stores compressed COCO RLE. Images are joined through the GPIC `image_key`, not embedded in these portable training tables. Rich pipeline records remain under `data/`, while zero-mask and unparseable rows remain metadata-only in `audit_all_processed` and are never training examples.
+
+Per-prompt BCC image/context-limit failures are terminal per-image skips, not unit failures. If a mixed vLLM batch hits that validation, the worker isolates its items, retains valid neighbors, and writes `bcc_input_too_large` only for the offending input. `campaign-skip-oversized-bcc` exists only to migrate quarantines created before that behavior was added.
 
 ## Integrity and repair records
 

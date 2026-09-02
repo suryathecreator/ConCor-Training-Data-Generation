@@ -5,16 +5,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 from sam3_mask_captioning.campaign_manifest import extend_from_manifest, initialize_campaign
-from sam3_mask_captioning.campaign_runner import _success_path, merge_stage
-from sam3_mask_captioning.dataset_export import export_hf_dataset
+from sam3_mask_captioning.campaign_runner import _mask_rle, _success_path, merge_stage
+from sam3_mask_captioning.dataset_export import _coco_compressed_counts, export_hf_dataset
 from sam3_mask_captioning.io_utils import read_jsonl, write_json, write_jsonl
 from sam3_mask_captioning.selection import load_exclusion_csv, read_source_manifest
 
 
 class PublicReleaseTests(unittest.TestCase):
+    def test_coco_rle_matches_reference_encoder(self):
+        mask = np.zeros((23, 17), dtype=np.uint8, order="F")
+        mask[1:8, 3:9] = 1
+        mask[10:22, 0:2] = 1
+        # Verified byte-for-byte against pycocotools 2.0.10.
+        self.assertEqual(_coco_compressed_counts(mask), ":<;0>KG000000000g5")
+
     def test_csv_manifest_and_identifier_exclusions(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -115,6 +123,19 @@ class PublicReleaseTests(unittest.TestCase):
                 [audit(0, 10, included=False), audit(1, 3, included=True), audit(2, 2, included=True, parseable=False)],
                 unit / "bcc_validation_audit.jsonl",
             )
+            mask_rows = []
+            for index, count in ((0, 10), (1, 3), (2, 2)):
+                mask = root / f"mask-{index}.png"
+                Image.new("L", (8, 8), 255).save(mask)
+                for group in range(count):
+                    mask_rows.append(
+                        {
+                            "image_id": f"image-{index}",
+                            "mask_id": f"mask-{index}-{group}",
+                            "rle": _mask_rle(mask),
+                        }
+                    )
+            write_jsonl(mask_rows, unit / "mask_rle.jsonl")
             write_json({"stage": "bcc", "unit_id": 0}, _success_path(unit, "bcc"))
             output = root / "export"
             stats = export_hf_dataset(campaign, output, include_image_bytes=False, shard_size=100)
@@ -128,6 +149,30 @@ class PublicReleaseTests(unittest.TestCase):
             self.assertEqual(min10[0]["image_id"], "image-0")
             self.assertEqual(low[0]["image_id"], "image-1")
             self.assertEqual(len(audit_rows), 4)
+            standard = pq.read_table(
+                output / "train" / "gpic_min_10-00000.parquet"
+            )
+            self.assertEqual(
+                standard.column_names,
+                [
+                    "dataset",
+                    "split",
+                    "image_key",
+                    "image_id",
+                    "height",
+                    "width",
+                    "caption",
+                    "groups_json",
+                    "masks_json",
+                ],
+            )
+            standard_row = standard.to_pylist()[0]
+            self.assertEqual(standard_row["height"], 8)
+            self.assertEqual(standard_row["width"], 8)
+            self.assertEqual(len(json.loads(standard_row["groups_json"])), 10)
+            masks = json.loads(standard_row["masks_json"])
+            self.assertEqual(len(masks), 10)
+            self.assertTrue(all(isinstance(value["counts"], str) for value in masks.values()))
 
 
 if __name__ == "__main__":

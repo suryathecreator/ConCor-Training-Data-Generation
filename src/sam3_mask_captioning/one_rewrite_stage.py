@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from .bcc_contract import ONE_REWRITE_CONTRACT_VERSION
+from .bcc_runtime_limits import (
+    bcc_input_skip_record,
+    generate_many_bcc_with_input_isolation,
+)
 from .bcc_audit import (
     CHECKER_AUDIT_VERSION,
     compare_issue_sets,
@@ -210,6 +214,14 @@ def run_bcc_draft_batch(
         if _is_current_correspondence_record(row)
         and row.get("contract_version") == ONE_REWRITE_CONTRACT_VERSION
     }
+    completed.update(
+        str(row.get("image_id") or "")
+        for row in (
+            read_jsonl_indexed(excluded_path) if excluded_path.exists() else []
+        )
+        if row.get("contract_version") == ONE_REWRITE_CONTRACT_VERSION
+        and row.get("image_id")
+    )
     persisted_drafts = {
         str(row.get("image_id") or ""): row
         for row in (read_jsonl_indexed(raw_path) if raw_path.exists() else [])
@@ -267,6 +279,7 @@ def run_bcc_draft_batch(
         captioner = create_captioner(config, "image_caption")
     for batch in _bcc_packet_batches(prepared, stage):
         pending = [item for item in batch if item["persisted_draft"] is None]
+        skipped_by_image: dict[str, str] = {}
         if mock:
             generated = [
                 {
@@ -275,23 +288,37 @@ def run_bcc_draft_batch(
                 }
                 for item in pending
             ]
+            generated_by_image = {
+                item["image_id"]: result for item, result in zip(pending, generated)
+            }
         elif pending:
             generation_config = bcc_generation_config(
                 config, "image_caption", max(len(item["rows"]) for item in pending)
             )
-            generated = captioner.generate_many_bcc(
-                [item["packet"] for item in pending],
-                [item["prompt"] for item in pending],
-                [item["seed"] for item in pending],
-                batch_size=len(pending),
+            generated_by_image, skipped_by_image = generate_many_bcc_with_input_isolation(
+                captioner,
+                pending,
                 generation_config=generation_config,
+                max_images_per_prompt=int(stage.get("max_images_per_prompt", 128)),
             )
         else:
-            generated = []
-        generated_by_image = {
-            item["image_id"]: result for item, result in zip(pending, generated)
-        }
+            generated_by_image = {}
+        for item in pending:
+            diagnostic = skipped_by_image.get(item["image_id"])
+            if diagnostic is not None:
+                append_jsonl(
+                    bcc_input_skip_record(
+                        item,
+                        stage="bcc_draft",
+                        diagnostic=diagnostic,
+                        contract_version=ONE_REWRITE_CONTRACT_VERSION,
+                    ),
+                    excluded_path,
+                    durable=True,
+                )
         for item in batch:
+            if item["image_id"] in skipped_by_image:
+                continue
             persisted = item["persisted_draft"]
             result = persisted or generated_by_image[item["image_id"]]
             raw = str(result.get("raw") or "")
@@ -496,7 +523,7 @@ def run_bcc_one_rewrite_batch(
             )
             append_jsonl({**audit, "reason_code": reason}, excluded_path, durable=True)
             exclusion_ids.add(image_id)
-    completed = set(audit_by_image)
+    completed = set(audit_by_image) | exclusion_ids
     stage = config.get("image_caption_qa", {})
     min_input_masks = int(
         config.get("image_caption", {}).get(
@@ -572,6 +599,7 @@ def run_bcc_one_rewrite_batch(
         captioner = create_captioner(config, "image_caption_qa")
     for batch in _bcc_packet_batches(prepared, stage):
         pending = [item for item in batch if item["persisted_rewrite"] is None]
+        skipped_by_image: dict[str, str] = {}
         if mock:
             generated = [
                 {
@@ -580,6 +608,9 @@ def run_bcc_one_rewrite_batch(
                 }
                 for item in pending
             ]
+            generated_by_image = {
+                item["image_id"]: result for item, result in zip(pending, generated)
+            }
         elif pending:
             runtime = bcc_generation_config(
                 config,
@@ -587,19 +618,30 @@ def run_bcc_one_rewrite_batch(
                 max(len(item["rows"]) for item in pending),
                 text_only_repair=False,
             )
-            generated = captioner.generate_many_bcc(
-                [item["packet"] for item in pending],
-                [item["prompt"] for item in pending],
-                [item["seed"] for item in pending],
-                batch_size=len(pending),
+            generated_by_image, skipped_by_image = generate_many_bcc_with_input_isolation(
+                captioner,
+                pending,
                 generation_config=runtime,
+                max_images_per_prompt=int(stage.get("max_images_per_prompt", 128)),
             )
         else:
-            generated = []
-        generated_by_image = {
-            item["image_id"]: result for item, result in zip(pending, generated)
-        }
+            generated_by_image = {}
+        for item in pending:
+            diagnostic = skipped_by_image.get(item["image_id"])
+            if diagnostic is not None:
+                append_jsonl(
+                    bcc_input_skip_record(
+                        item,
+                        stage="bcc_rewrite",
+                        diagnostic=diagnostic,
+                        contract_version=ONE_REWRITE_CONTRACT_VERSION,
+                    ),
+                    excluded_path,
+                    durable=True,
+                )
         for item in batch:
+            if item["image_id"] in skipped_by_image:
+                continue
             persisted = item["persisted_rewrite"]
             result = persisted or generated_by_image[item["image_id"]]
             raw = str(result.get("raw") or "")

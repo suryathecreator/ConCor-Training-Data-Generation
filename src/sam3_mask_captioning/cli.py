@@ -170,6 +170,10 @@ def main() -> None:
     campaign_repair.add_argument("--reason", default="integrity_repair")
     campaign_repair.add_argument("--apply", action="store_true")
 
+    campaign_skip_bcc = sub.add_parser("campaign-skip-oversized-bcc")
+    campaign_skip_bcc.add_argument("campaign_root")
+    campaign_skip_bcc.add_argument("--apply", action="store_true")
+
     vllm_canary = sub.add_parser("vllm-canary")
     vllm_canary.add_argument("fixture_run")
     vllm_canary.add_argument("--output", required=True)
@@ -309,6 +313,20 @@ def main() -> None:
             reason=args.reason,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if args.command == "campaign-skip-oversized-bcc":
+        from .campaign_skip import finalize_quarantined_bcc_input_limits
+
+        print(
+            json.dumps(
+                finalize_quarantined_bcc_input_limits(
+                    args.campaign_root,
+                    apply=args.apply,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return
     if args.command == "summarize":
         from .summarize import summarize_run

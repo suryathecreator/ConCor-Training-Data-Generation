@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConCor-1-compatible caption record",
+  "type": "object",
+  "required": [
+    "dataset",
+    "split",
+    "image_key",
+    "image_id",
+    "height",
+    "width",
+    "caption",
+    "groups_json",
+    "masks_json"
+  ],
+  "properties": {
+    "dataset": {"type": "string"},
+    "split": {"type": "string"},
+    "image_key": {"type": "string"},
+    "image_id": {"type": "string"},
+    "height": {"type": "integer", "minimum": 1},
+    "width": {"type": "integer", "minimum": 1},
+    "caption": {"type": "string", "minLength": 1},
+    "groups_json": {
+      "type": "string",
+      "description": "JSON correspondences: half-open caption spans, matching text, and instance IDs"
+    },
+    "masks_json": {
+      "type": "string",
+      "description": "JSON map from instance ID to compressed COCO RLE"
+    }
+  },
+  "additionalProperties": false
+}

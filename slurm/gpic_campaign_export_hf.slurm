@@ -23,5 +23,5 @@ else
   mkdir -p "$EXPORT_DIR"
   rsync -a "$REPO_ROOT/hf_dataset/" "$EXPORT_DIR/"
   "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-export-hf \
-    "$CAMPAIGN_ROOT" "$EXPORT_DIR" --shard-size 100
+    "$CAMPAIGN_ROOT" "$EXPORT_DIR" --shard-size 100 --no-image-bytes
 fi

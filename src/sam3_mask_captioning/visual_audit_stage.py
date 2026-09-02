@@ -9,6 +9,10 @@ from .bcc_contract import (
     SIMPLE_REWRITE_CHECK_VERSION,
     VISUAL_AUDIT_VERSION,
 )
+from .bcc_runtime_limits import (
+    bcc_input_skip_record,
+    generate_many_bcc_with_input_isolation,
+)
 from .caption_stage import QwenCaptioner, _generation_metrics, create_captioner
 from .correspondence_stage import (
     BCC_PROMPT_VERSION,
@@ -372,6 +376,7 @@ def run_bcc_visual_audit_batch(
     candidate_path = run_dir / "image_caption_candidates.jsonl"
     raw_path = run_dir / "bcc_visual_audit_raw.jsonl"
     audit_path = run_dir / "bcc_visual_audits.jsonl"
+    excluded_path = run_dir / "bcc_exclusions.jsonl"
     candidates = {
         str(row.get("image_id") or ""): row
         for row in (read_jsonl_indexed(candidate_path) if candidate_path.exists() else [])
@@ -384,6 +389,14 @@ def run_bcc_visual_audit_batch(
         if row.get("audit_version") == VISUAL_AUDIT_VERSION
         and row.get("contract_version") == ONE_REWRITE_CONTRACT_VERSION
     }
+    completed.update(
+        str(row.get("image_id") or "")
+        for row in (
+            read_jsonl_indexed(excluded_path) if excluded_path.exists() else []
+        )
+        if row.get("contract_version") == ONE_REWRITE_CONTRACT_VERSION
+        and row.get("image_id")
+    )
     persisted_raw = {
         str(row.get("image_id") or ""): row
         for row in (read_jsonl_indexed(raw_path) if raw_path.exists() else [])
@@ -432,6 +445,7 @@ def run_bcc_visual_audit_batch(
         captioner = create_captioner(config, "image_caption_audit")
     for batch in _bcc_packet_batches(prepared, stage):
         pending = [item for item in batch if item["persisted"] is None]
+        skipped_by_image: dict[str, str] = {}
         if mock:
             generated = [
                 {
@@ -449,6 +463,9 @@ def run_bcc_visual_audit_batch(
                 }
                 for _ in pending
             ]
+            generated_by_id = {
+                item["image_id"]: result for item, result in zip(pending, generated)
+            }
         elif pending:
             runtime = bcc_generation_config(
                 config,
@@ -456,19 +473,30 @@ def run_bcc_visual_audit_batch(
                 max(len(item["rows"]) for item in pending),
             )
             runtime["json_schema"] = BCC_VISUAL_AUDIT_SCHEMA
-            generated = captioner.generate_many_bcc(
-                [item["packet"] for item in pending],
-                [item["prompt"] for item in pending],
-                [item["seed"] for item in pending],
-                batch_size=len(pending),
+            generated_by_id, skipped_by_image = generate_many_bcc_with_input_isolation(
+                captioner,
+                pending,
                 generation_config=runtime,
+                max_images_per_prompt=int(stage.get("max_images_per_prompt", 128)),
             )
         else:
-            generated = []
-        generated_by_id = {
-            item["image_id"]: result for item, result in zip(pending, generated)
-        }
+            generated_by_id = {}
+        for item in pending:
+            diagnostic = skipped_by_image.get(item["image_id"])
+            if diagnostic is not None:
+                append_jsonl(
+                    bcc_input_skip_record(
+                        item,
+                        stage="bcc_visual_audit",
+                        diagnostic=diagnostic,
+                        contract_version=ONE_REWRITE_CONTRACT_VERSION,
+                    ),
+                    excluded_path,
+                    durable=True,
+                )
         for item in batch:
+            if item["image_id"] in skipped_by_image:
+                continue
             persisted = item["persisted"]
             result = persisted or generated_by_id[item["image_id"]]
             raw = str(result.get("raw") or "")

@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from .artifact_store import read_tar_member
 from .campaign_manifest import load_registry
 from .io_utils import read_jsonl, write_json
 
 
-DATASET_EXPORT_VERSION = "concor-bcc-parquet-v1"
+DATASET_EXPORT_VERSION = "concor-bcc-parquet-v2-concor1-compatible"
+CONCOR_CAPTION_FORMAT_VERSION = "concor-1-caption-schema-v1"
 TRAINING_VIEWS = ("min_10_masks", "masks_1_to_9", "parseable_1_plus")
 ALL_VIEWS = (*TRAINING_VIEWS, "audit_all_processed")
 
@@ -45,6 +50,136 @@ def _counts(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 def _histogram(values: list[int]) -> dict[str, int]:
     return {str(key): value for key, value in sorted(Counter(values).items())}
+
+
+def _decode_internal_rle(encoded: dict[str, Any]) -> np.ndarray:
+    if encoded.get("encoding") != "zlib-packbits-base64-v1":
+        raise ValueError(f"Unsupported internal mask encoding: {encoded.get('encoding')}")
+    packed = zlib.decompress(base64.b64decode(str(encoded["data"])))
+    flat = np.unpackbits(
+        np.frombuffer(packed, dtype=np.uint8),
+        bitorder=str(encoded.get("bitorder") or "little"),
+    )[: int(encoded["pixel_count"])]
+    return flat.astype(bool).reshape(
+        [int(value) for value in encoded["size"]],
+        order=str(encoded.get("order") or "F"),
+    )
+
+
+def _coco_compressed_counts(mask: np.ndarray) -> str:
+    """Encode a binary mask using COCO's compressed RLE string format."""
+    flat = np.asarray(mask, dtype=np.uint8).reshape(-1, order="F")
+    if flat.size == 0:
+        runs = np.asarray([0], dtype=np.int64)
+    else:
+        changes = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+        runs = np.diff(
+            np.concatenate(
+                (
+                    np.asarray([0], dtype=np.int64),
+                    changes.astype(np.int64),
+                    np.asarray([flat.size], dtype=np.int64),
+                )
+            )
+        )
+        if bool(flat[0]):
+            runs = np.concatenate((np.asarray([0], dtype=np.int64), runs))
+
+    counts = [int(value) for value in runs]
+    encoded: list[str] = []
+    for index, value in enumerate(counts):
+        delta = value - counts[index - 2] if index > 2 else value
+        more = True
+        while more:
+            char = delta & 0x1F
+            delta >>= 5
+            more = delta != (-1 if char & 0x10 else 0)
+            if more:
+                char |= 0x20
+            char += 48
+            encoded.append(chr(char))
+    return "".join(encoded)
+
+
+def internal_rle_to_coco(encoded: dict[str, Any]) -> dict[str, Any]:
+    mask = _decode_internal_rle(encoded)
+    return {
+        "size": [int(mask.shape[0]), int(mask.shape[1])],
+        "counts": _coco_compressed_counts(mask),
+    }
+
+
+def to_concor_caption_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Adapt one rich pipeline row to the ConCor-1 caption-column contract."""
+    caption = str(record.get("caption") or "")
+    source_rles = json.loads(str(record.get("accepted_mask_rles_json") or "{}"))
+    source_groups = json.loads(str(record.get("correspondence_groups_json") or "[]"))
+    groups: list[dict[str, Any]] = []
+    linked_ids: set[str] = set()
+    for source_group in source_groups:
+        spans = [
+            [int(span[0]), int(span[1])]
+            for span in source_group.get("char_spans") or []
+        ]
+        if not spans:
+            continue
+        instance_ids = [
+            str(value)
+            for value in (
+                source_group.get("instance_ids")
+                or [source_group.get("mask_id")]
+            )
+            if value
+        ]
+        if not instance_ids:
+            continue
+        for start, end in spans:
+            if start < 0 or end <= start or end > len(caption):
+                raise ValueError(
+                    f"Invalid caption span [{start}, {end}) for {record.get('image_id')}"
+                )
+        groups.append(
+            {
+                "char_spans": spans,
+                "text": [caption[start:end] for start, end in spans],
+                "instance_ids": instance_ids,
+            }
+        )
+        linked_ids.update(instance_ids)
+    missing = sorted(linked_ids - source_rles.keys())
+    if missing:
+        raise ValueError(
+            f"ConCor export is missing {len(missing)} linked mask RLE(s) for "
+            f"{record.get('image_id')}: {missing[:3]}"
+        )
+    masks = {
+        mask_id: internal_rle_to_coco(source_rles[mask_id])
+        for mask_id in sorted(linked_ids)
+    }
+    if not groups or not masks:
+        raise ValueError(
+            f"ConCor caption record has no linked groups/masks: {record.get('image_id')}"
+        )
+    height, width = next(iter(masks.values()))["size"]
+    dataset_name = str(record.get("source_dataset") or "gpic")
+    if dataset_name == "stanford-vision-lab/gpic":
+        dataset_name = "gpic"
+    return {
+        "dataset": dataset_name,
+        "split": str(record.get("source_split") or "train"),
+        "image_key": str(
+            record.get("source_pair_key")
+            or record.get("image_filename")
+            or record.get("image_id")
+            or ""
+        ),
+        "image_id": str(record.get("image_id") or ""),
+        "height": int(height),
+        "width": int(width),
+        "caption": caption,
+        "groups_json": json.dumps(groups, ensure_ascii=False, separators=(",", ":")),
+        "masks_json": json.dumps(masks, ensure_ascii=False, separators=(",", ":")),
+    }
 
 
 def _histogram_svg(histogram: dict[str, int], title: str, path: Path) -> None:
@@ -96,24 +231,31 @@ def _parseable(audit: dict[str, Any] | None) -> bool:
 
 
 def _write_parquet_shards(
-    records: list[dict[str, Any]], output: Path, shard_size: int
+    records: list[dict[str, Any]],
+    output: Path,
+    shard_size: int,
+    *,
+    manifest_root: Path | None = None,
+    file_prefix: str = "train",
 ) -> list[dict[str, Any]]:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     output.mkdir(parents=True, exist_ok=True)
-    for old in output.glob("train-*.parquet"):
+    for old in output.glob(f"{file_prefix}-*.parquet"):
         old.unlink()
     manifest: list[dict[str, Any]] = []
     for start in range(0, len(records), shard_size):
         shard_records = records[start : start + shard_size]
-        path = output / f"train-{start // shard_size:05d}.parquet"
+        path = output / f"{file_prefix}-{start // shard_size:05d}.parquet"
         temporary = path.with_suffix(".parquet.tmp")
         pq.write_table(pa.Table.from_pylist(shard_records), temporary, compression="zstd")
         temporary.replace(path)
         manifest.append(
             {
-                "path": path.relative_to(output.parent.parent).as_posix(),
+                "path": path.relative_to(
+                    manifest_root or output.parent.parent
+                ).as_posix(),
                 "start": start,
                 "end": start + len(shard_records) - 1,
                 "rows": len(shard_records),
@@ -167,7 +309,12 @@ def export_hf_dataset(
             parseable = _parseable(audit)
             groups = list((audit or {}).get("groups") or []) if parseable else []
             linked_mask_ids = {
-                str(group.get("mask_id") or "") for group in groups if group.get("mask_id")
+                str(mask_id)
+                for group in groups
+                for mask_id in (
+                    group.get("instance_ids") or [group.get("mask_id")]
+                )
+                if mask_id
             }
             final_count = len(linked_mask_ids)
             review = reviews.get(image_id) or {}
@@ -226,9 +373,42 @@ def export_hf_dataset(
         "parseable_1_plus": parseable_1_plus,
         "audit_all_processed": all_processed,
     }
+    # Public training configs use exactly the nine-column caption schema from
+    # UWGZQ/ConCor-1-Data. The richer pipeline/audit tables above remain
+    # available for provenance and debugging but are not required by ConCor
+    # training loaders. Convert once before any Parquet is written so schema or
+    # mask failures cannot leave a seemingly complete partial export.
+    standard_by_image = {
+        str(row["image_id"]): to_concor_caption_record(row)
+        for row in parseable_1_plus
+    }
+    standard_views = {
+        "gpic_min_10": [standard_by_image[str(row["image_id"])] for row in min_10],
+        "gpic_1_to_9": [
+            standard_by_image[str(row["image_id"])] for row in masks_1_to_9
+        ],
+        "gpic_parseable_1_plus": [
+            standard_by_image[str(row["image_id"])] for row in parseable_1_plus
+        ],
+    }
     shard_manifests = {
-        name: _write_parquet_shards(rows, output / "data" / name, max(1, shard_size))
+        name: _write_parquet_shards(
+            rows,
+            output / "data" / name,
+            max(1, shard_size),
+            manifest_root=output,
+        )
         for name, rows in views.items()
+    }
+    standard_shards = {
+        name: _write_parquet_shards(
+            rows,
+            output / "train",
+            max(1, shard_size),
+            manifest_root=output,
+            file_prefix=name,
+        )
+        for name, rows in standard_views.items()
     }
     histograms = {
         "all_sam3_proposal_counts": _histogram([int(row["sam3_proposal_count"]) for row in all_processed]),
@@ -239,6 +419,7 @@ def export_hf_dataset(
     }
     stats = {
         "dataset_export_version": DATASET_EXPORT_VERSION,
+        "concor_caption_format_version": CONCOR_CAPTION_FORMAT_VERSION,
         "processed_raw_images": len(all_processed),
         "parseable_1_plus": len(parseable_1_plus),
         "min_10_masks": len(min_10),
@@ -246,6 +427,7 @@ def export_hf_dataset(
         "audit_only_zero_or_unparseable": len(all_processed) - len(parseable_1_plus),
         "histograms": histograms,
         "shards": shard_manifests,
+        "concor_standard_shards": standard_shards,
     }
     write_json(stats, output / "stats" / "summary.json")
     _histogram_svg(histograms["all_sam3_proposal_counts"], "All processed images: SAM3 proposals", output / "stats" / "all_sam3_proposals.svg")

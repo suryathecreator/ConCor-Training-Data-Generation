@@ -44,5 +44,5 @@ done
 
 "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-publish "$CAMPAIGN_ROOT"
 "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-export-hf \
-  "$CAMPAIGN_ROOT" "$CAMPAIGN_ROOT/hf_export" --shard-size 100
+  "$CAMPAIGN_ROOT" "$CAMPAIGN_ROOT/hf_export" --shard-size 100 --no-image-bytes
 echo "Complete: $CAMPAIGN_ROOT"
