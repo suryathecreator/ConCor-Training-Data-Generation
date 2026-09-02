@@ -230,6 +230,19 @@ def _parseable(audit: dict[str, Any] | None) -> bool:
     return str(audit.get("reason_code") or "") != "final_rewrite_unparseable"
 
 
+def _portable_public_json(value: Any) -> Any:
+    """Remove host-specific absolute paths from public audit payloads."""
+    if isinstance(value, dict):
+        return {str(key): _portable_public_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_portable_public_json(item) for item in value]
+    if isinstance(value, tuple):
+        return [_portable_public_json(item) for item in value]
+    if isinstance(value, str) and Path(value).is_absolute():
+        return Path(value).name
+    return value
+
+
 def _write_parquet_shards(
     records: list[dict[str, Any]],
     output: Path,
@@ -349,7 +362,11 @@ def export_hf_dataset(
                 "included_min_10": bool(parseable and final_count >= 10),
                 "disposition": reason,
                 "caption": str((audit or {}).get("caption") or "") if parseable else "",
-                "correspondence_groups_json": json.dumps(groups, ensure_ascii=False, sort_keys=True),
+                "correspondence_groups_json": json.dumps(
+                    _portable_public_json(groups),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 "accepted_mask_rles_json": json.dumps(
                     {mask_id: rles[mask_id] for mask_id in sorted(linked_mask_ids) if mask_id in rles},
                     ensure_ascii=False,
@@ -360,7 +377,11 @@ def export_hf_dataset(
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
-                "bcc_record_json": json.dumps(audit or exclusion or {}, ensure_ascii=False, sort_keys=True),
+                "bcc_record_json": json.dumps(
+                    _portable_public_json(audit or exclusion or {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             }
             all_processed.append(record)
 

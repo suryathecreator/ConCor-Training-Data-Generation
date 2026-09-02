@@ -108,6 +108,7 @@ class PublicReleaseTests(unittest.TestCase):
                 caption = "Objects are arranged." if parseable else "broken"
                 return {
                     "image_id": f"image-{index}",
+                    "source_image_path": str(root / f"image-{index}.png"),
                     "included": included,
                     "caption": caption,
                     "groups": [
@@ -149,6 +150,9 @@ class PublicReleaseTests(unittest.TestCase):
             self.assertEqual(min10[0]["image_id"], "image-0")
             self.assertEqual(low[0]["image_id"], "image-1")
             self.assertEqual(len(audit_rows), 4)
+            published_audit = json.loads(audit_rows[0]["bcc_record_json"])
+            self.assertEqual(published_audit["source_image_path"], "image-0.png")
+            self.assertNotIn(str(root), audit_rows[0]["bcc_record_json"])
             standard = pq.read_table(
                 output / "train" / "gpic_min_10-00000.parquet"
             )
