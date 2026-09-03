@@ -277,7 +277,7 @@ def _write_parquet_shards(
     return manifest
 
 
-def export_hf_dataset(
+def _legacy_export_hf_dataset(
     campaign_root: str | Path,
     output_dir: str | Path,
     *,
@@ -457,3 +457,8 @@ def export_hf_dataset(
     _histogram_svg(histograms["min_10_final_linked_masks"], "Parseable BCC examples (>=10): final linked masks", output / "stats" / "min_10_masks.svg")
     _histogram_svg(histograms["masks_1_to_9_final_linked_masks"], "Parseable BCC examples (1-9): final linked masks", output / "stats" / "masks_1_to_9.svg")
     return stats
+
+
+# Keep the established import path while using the checkpointed implementation.
+# The legacy implementation above remains readable for format history.
+from .resumable_export import export_hf_dataset as export_hf_dataset

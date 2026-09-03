@@ -135,6 +135,7 @@ def main() -> None:
     campaign_merge.add_argument("--stage", choices=STAGES, required=True)
     campaign_merge.add_argument("--wait", action="store_true")
     campaign_merge.add_argument("--poll-seconds", type=int, default=30)
+    campaign_merge.add_argument("--metadata-only", action="store_true")
 
     campaign_publish = sub.add_parser("campaign-publish")
     campaign_publish.add_argument("campaign_root")
@@ -149,6 +150,7 @@ def main() -> None:
     campaign_export.add_argument("campaign_root")
     campaign_export.add_argument("output_dir")
     campaign_export.add_argument("--shard-size", type=int, default=100)
+    campaign_export.add_argument("--checkpoint-units", type=int, default=100)
     campaign_export.add_argument("--no-image-bytes", action="store_true")
 
     campaign_status_parser = sub.add_parser("campaign-status")
@@ -237,9 +239,14 @@ def main() -> None:
                 args.campaign_root,
                 args.stage,
                 poll_seconds=args.poll_seconds,
+                consolidate_outputs=not args.metadata_only,
             )
             if args.wait
-            else merge_stage(args.campaign_root, args.stage)
+            else merge_stage(
+                args.campaign_root,
+                args.stage,
+                consolidate_outputs=not args.metadata_only,
+            )
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return
@@ -272,6 +279,7 @@ def main() -> None:
             args.output_dir,
             shard_size=args.shard_size,
             include_image_bytes=not args.no_image_bytes,
+            checkpoint_units=args.checkpoint_units,
         ), indent=2, sort_keys=True))
         return
     if args.command == "campaign-status":

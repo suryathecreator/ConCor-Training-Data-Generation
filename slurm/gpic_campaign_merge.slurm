@@ -16,8 +16,13 @@ unset VLLM_PYTHON
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
+merge_args=()
+if [ "${MERGE_OUTPUTS:-0}" != "1" ]; then
+  merge_args+=(--metadata-only)
+fi
 "$PYTHON_BIN" -m sam3_mask_captioning.cli campaign-merge "$CAMPAIGN_ROOT" \
-  --stage "$STAGE" --wait --poll-seconds "${MERGE_POLL_SECONDS:-30}"
+  --stage "$STAGE" --wait --poll-seconds "${MERGE_POLL_SECONDS:-30}" \
+  "${merge_args[@]}"
 
 # A faster cohort may have completed all units while another cohort remained
 # queued. Those exact same-stage arrays are now redundant and safe to cancel.

@@ -27,13 +27,17 @@ Each campaign is split into immutable source units. A stage-level filesystem loc
 
 SAM 3 success additionally requires exact one-to-one agreement among unique manifest IDs, mask PNGs, inverse crops, RLE rows, and archive members. Interrupted images are cleared and regenerated at image granularity, preventing a resumed unit from appending duplicate semantic rows. Failed unit attempts are counted persistently across jobs; reaching the configured limit creates `_QUARANTINED.json`, which makes the merge fail with the exact unit IDs instead of polling forever.
 
-After every stage barrier:
+After every stage barrier, the pipeline writes:
 
-- `merged/<stage>/manifest.json` lists concatenated JSONL outputs, row counts, checksums, and any size-based rollover shards.
 - `reports/run_ledger.csv` and `.jsonl` contain one source image per row with image review, SAM proposal, mask QA, consistency, BCC, count, and disposition fields.
 - `reports/run_ledger_summary.json` provides compact totals.
 
-The Hugging Face export writes three training configs in the nine-column ConCor-1 caption format: `dataset`, `split`, `image_key`, `image_id`, `height`, `width`, `caption`, `groups_json`, and `masks_json`. `groups_json` stores half-open caption spans and linked instance IDs; `masks_json` stores compressed COCO RLE. Images are joined through the GPIC `image_key`, not embedded in these portable training tables. Rich pipeline records remain under `data/`, while zero-mask and unparseable rows remain metadata-only in `audit_all_processed` and are never training examples.
+Consolidated JSONL is optional. With `MERGE_OUTPUTS=1`, `merged/<stage>/manifest.json` lists bounded shards, row counts, and checksums. `.merge_state.json` stores the durable stream/unit cursor, so a requeued merge reuses committed shards and truncates only uncommitted tail bytes.
+
+
+The Hugging Face export reads unit outputs directly and does not require consolidated JSONL. Fixed ranges of source units are atomically converted under a sibling `.EXPORT_NAME.checkpoints/` directory. Final Parquet shards are also atomic and tracked by row count and byte size; both layers are reused after requeue.
+
+It writes three training configs in the nine-column ConCor-1 caption format: `dataset`, `split`, `image_key`, `image_id`, `height`, `width`, `caption`, `groups_json`, and `masks_json`. `groups_json` stores half-open caption spans and linked instance IDs; `masks_json` stores compressed COCO RLE. Images are joined through the GPIC `image_key`, not embedded in these portable training tables. Rich pipeline records remain under `data/`, while zero-mask and unparseable rows remain metadata-only in `audit_all_processed` and are never training examples.
 
 Per-prompt BCC image/context-limit failures are terminal per-image skips, not unit failures. If a mixed vLLM batch hits that validation, the worker isolates its items, retains valid neighbors, and writes `bcc_input_too_large` only for the offending input. `campaign-skip-oversized-bcc` exists only to migrate quarantines created before that behavior was added.
 

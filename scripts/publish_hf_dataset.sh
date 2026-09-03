@@ -18,7 +18,8 @@ fi
 mkdir -p "$EXPORT_DIR"
 rsync -a "$SCAFFOLD/" "$EXPORT_DIR/"
 "$VLLM_PYTHON" -m sam3_mask_captioning.cli campaign-export-hf \
-  "$CAMPAIGN_ROOT" "$EXPORT_DIR" --shard-size 100 --no-image-bytes
+  "$CAMPAIGN_ROOT" "$EXPORT_DIR" --shard-size 100 --no-image-bytes \
+  --checkpoint-units "${EXPORT_CHECKPOINT_UNITS:-100}"
 # The public audit Parquet already contains portable per-image dispositions.
 # Never upload internal campaign registries/reports: they may contain cluster
 # paths and scheduler metadata that are irrelevant to dataset consumers.

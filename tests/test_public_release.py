@@ -75,6 +75,11 @@ class PublicReleaseTests(unittest.TestCase):
             unit = campaign / "units" / "000000"
             write_jsonl([{"image_id": "one", "accepted": True, "rationale": "usable"}], unit / "image_reviews.jsonl")
             write_json({"stage": "image-review", "unit_id": 0}, _success_path(unit, "image-review"))
+            barrier = merge_stage(campaign, "image-review", consolidate_outputs=False)
+            self.assertTrue(barrier["outputs"]["skipped"])
+            self.assertFalse((campaign / "merged" / "image-review").exists())
+
+
             result = merge_stage(campaign, "image-review")
             self.assertEqual(result["outputs"]["streams"][0]["rows"], 1)
             self.assertTrue((campaign / "merged" / "image-review" / "image_reviews.jsonl").exists())
@@ -177,6 +182,19 @@ class PublicReleaseTests(unittest.TestCase):
             masks = json.loads(standard_row["masks_json"])
             self.assertEqual(len(masks), 10)
             self.assertTrue(all(isinstance(value["counts"], str) for value in masks.values()))
+            published_shard = output / "data" / "min_10_masks" / "train-00000.parquet"
+            checkpoint_shard = (
+                output.parent / ".export.checkpoints" / "chunks" / "chunk-00000-records.parquet"
+            )
+            published_mtime = published_shard.stat().st_mtime_ns
+            checkpoint_mtime = checkpoint_shard.stat().st_mtime_ns
+            repeated = export_hf_dataset(
+                campaign, output, include_image_bytes=False, shard_size=100
+            )
+            self.assertEqual(repeated["processed_raw_images"], 4)
+            self.assertEqual(published_shard.stat().st_mtime_ns, published_mtime)
+            self.assertEqual(checkpoint_shard.stat().st_mtime_ns, checkpoint_mtime)
+
 
 
 if __name__ == "__main__":

@@ -842,7 +842,12 @@ def run_stage_worker(
     }
 
 
-def merge_stage(campaign_root: str | Path, stage: str) -> dict[str, Any]:
+def merge_stage(
+    campaign_root: str | Path,
+    stage: str,
+    *,
+    consolidate_outputs: bool = True,
+) -> dict[str, Any]:
     if stage not in STAGES:
         raise ValueError(stage)
     campaign_root = Path(campaign_root).expanduser().resolve()
@@ -874,7 +879,11 @@ def merge_stage(campaign_root: str | Path, stage: str) -> dict[str, Any]:
     from .run_ledger import write_run_ledger
     from .stage_merge import merge_stage_jsonl
 
-    merged["outputs"] = merge_stage_jsonl(campaign_root, stage)
+    merged["outputs"] = (
+        merge_stage_jsonl(campaign_root, stage)
+        if consolidate_outputs
+        else {"skipped": True, "reason": "optional_output_consolidation_disabled"}
+    )
     merged["ledger"] = write_run_ledger(campaign_root)
     path = campaign_root / "stages" / stage / "_MERGED.json"
     write_json(merged, path)
@@ -886,6 +895,7 @@ def wait_for_stage_merge(
     stage: str,
     *,
     poll_seconds: int = 30,
+    consolidate_outputs: bool = True,
 ) -> dict[str, Any]:
     """Advance as soon as any combination of workers completes all units.
 
@@ -897,7 +907,11 @@ def wait_for_stage_merge(
     last_wait_reason = ""
     while True:
         try:
-            return merge_stage(campaign_root, stage)
+            return merge_stage(
+                campaign_root,
+                stage,
+                consolidate_outputs=consolidate_outputs,
+            )
         except RuntimeError as exc:
             reason = str(exc)
             recoverable_wait = reason.startswith(

@@ -285,7 +285,7 @@ submit_merge() {
     --job-name="bcc-q38-$stage-merge" \
     --partition="$CPU_PARTITION" "${CPU_ACCOUNT_ARGS[@]}" \
     --dependency="afterok:$prerequisite" \
-    --export="ALL,$common_export,STAGE=$stage,WORKER_JOB_IDS=$worker_jobs" \
+    --export="ALL,$common_export,STAGE=$stage,WORKER_JOB_IDS=$worker_jobs,MERGE_OUTPUTS=${MERGE_OUTPUTS:-0}" \
     "$REPO_ROOT/slurm/gpic_campaign_merge.slurm")"; then
     echo "Failed to submit $stage merge" >&2
     return 1

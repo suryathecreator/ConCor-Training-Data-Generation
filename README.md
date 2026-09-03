@@ -44,7 +44,7 @@ See [docs/DATA.md](docs/DATA.md) for the complete input/output contract and [doc
 3. **Mask caption + QA** — Qwen sees dynamically colored inverse-mask crops, writes a short identity description, and checks it against the proposal and pixels.
 4. **Consistency** — spaCy extracts the identity head, SAM 3 is prompted again in the same region, and the mask must match a returned proposal at IoU ≥ 0.5.
 5. **BCC captioning** — Qwen sees the original, numbered overlay, every inverse crop, and the accepted-mask context. It writes inline links, independently audits the pair, then performs exactly one rewrite. Deterministic checks validate syntax, span coverage, identity compatibility, and a few observed failure modes.
-6. **Publish** — units merge into bounded JSONL shards, an HTML audit site is built, a per-image CSV/JSONL ledger records every stage outcome, and ConCor-1-compatible Parquet views are exported.
+6. **Publish** — an HTML audit site and per-image CSV/JSONL ledger record every outcome, and ConCor-1-compatible Parquet views are exported directly from completed units. Consolidated JSONL is optional.
 
 The caption does not have to copy mask descriptions or mention every mask. A natural plural phrase can point to multiple masks, and a single mask can link to several text spans such as a noun phrase and later pronoun.
 
@@ -57,11 +57,24 @@ Training examples are separated by **mask count only**, not by audit style flags
 - `gpic_parseable_1_plus`: the union of all parseable examples with at least one linked mask.
 - `audit_all_processed`: every selected source image, including upstream rejection, zero-mask, unparseable, and failed outcomes. These audit-only rows are not training pairs.
 
-The three training configs use the same nine-column caption contract as [UWGZQ/ConCor-1-Data](https://huggingface.co/datasets/UWGZQ/ConCor-1-Data): source keys and dimensions plus `caption`, `groups_json`, and compressed-COCO-RLE `masks_json`. Every run also produces `reports/run_ledger.csv`, `run_ledger.jsonl`, and a summary. Stage outputs are concatenated after each barrier; files roll into numbered shards only after the configured size limit.
+The three training configs use the same nine-column caption contract as [UWGZQ/ConCor-1-Data](https://huggingface.co/datasets/UWGZQ/ConCor-1-Data): source keys and dimensions plus `caption`, `groups_json`, and compressed-COCO-RLE `masks_json`. Every run also produces `reports/run_ledger.csv`, `run_ledger.jsonl`, and a summary. Optional consolidated JSONL rolls into bounded numbered shards.
 
 ## Checkpoints and recovery
 
 Unit claims are fenced for the full stage transaction: stale-claim replacement is serialized, live claims are heartbeated, and every commit, cleanup, and release verifies the worker's unique ownership token. SAM 3 also checks that its manifest, mask PNGs, inverse crops, RLE rows, and packed archive agree exactly before writing `_SUCCESS.json`.
+
+Merge and export are safe to requeue. A JSONL merge records a durable source-unit cursor and reuses completed shards; pass `--metadata-only` to use the stage barrier without building consolidated JSONL. Cluster launchers do this by default; set `MERGE_OUTPUTS=1` only when those convenience files are wanted.
+
+Export reads completed units directly, independent of merge. It checkpoints fixed unit ranges before writing the public views, atomically publishes each Parquet shard, and skips validated shards after restart. The checkpoint directory is a sibling of the export directory, so it is not uploaded. Hugging Face `upload-large-folder` keeps its own resumable upload state.
+
+```bash
+concor campaign-merge outputs/campaigns/my_run --stage bcc --metadata-only
+concor campaign-export-hf outputs/campaigns/my_run outputs/campaigns/my_run/hf_publish \
+  --no-image-bytes --shard-size 100 --checkpoint-units 100
+```
+
+At most one merge checkpoint interval or one export unit batch is recomputed after abrupt preemption; completed Parquet shards are not rewritten.
+
 
 Audit a campaign without changing it:
 
